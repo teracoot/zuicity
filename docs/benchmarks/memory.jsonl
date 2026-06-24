@@ -1,0 +1,3 @@
+{"tag":"rust","client_peak_rss_kb":11124,"server_peak_rss_kb":13236,"client_idle_rss_kb":10420,"server_idle_rss_kb":13068}
+{"tag":"go","client_peak_rss_kb":17548,"server_peak_rss_kb":24692,"client_idle_rss_kb":17212,"server_idle_rss_kb":24100}
+{"tag":"juicityrs","client_peak_rss_kb":13184,"server_peak_rss_kb":33896,"client_idle_rss_kb":13184,"server_idle_rss_kb":32660}

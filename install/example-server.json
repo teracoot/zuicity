@@ -1,0 +1,10 @@
+{
+    "listen": "0.0.0.0:23182",
+    "users": {
+        "00000000-0000-0000-0000-000000000000": "my_password"
+    },
+    "certificate": "/etc/zuicity/fullchain.pem",
+    "private_key": "/etc/zuicity/private.key",
+    "congestion_control": "bbr",
+    "log_level": "info"
+}

@@ -1,0 +1,8 @@
+zuicity
+Copyright (C) 2026 The zuicity Authors
+
+This product is licensed under the GNU Affero General Public License v3.0
+(AGPL-3.0-only); see the LICENSE file for the full license text.
+
+zuicity is a Rust port of, and is built upon and highly inspired by, the
+upstream juicity project (https://github.com/juicity/juicity).

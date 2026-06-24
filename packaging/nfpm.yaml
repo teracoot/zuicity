@@ -1,0 +1,67 @@
+# nFPM metadata for Linux distro packages. Build scripts set VERSION and NFPM_ARCH.
+name: zuicity
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: net
+priority: optional
+maintainer: Zuicity Rust maintainers <noreply@github.com>
+description: |
+  Rust port of Zuicity, including zuicity-client and zuicity-server
+  with example configuration files and systemd unit templates.
+vendor: Zuicity
+homepage: https://github.com/teracoot/zuicity
+license: AGPL-3.0-only
+
+contents:
+  - src: ./target/release/zuicity-client
+    dst: /usr/bin/zuicity-client
+    file_info:
+      mode: 0755
+  - src: ./target/release/zuicity-server
+    dst: /usr/bin/zuicity-server
+    file_info:
+      mode: 0755
+  - dst: /etc/zuicity
+    type: dir
+    file_info:
+      mode: 0755
+  - src: ./install/example-client.json
+    dst: /etc/zuicity/client.json
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: ./install/example-server.json
+    dst: /etc/zuicity/server.json
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: ./install/zuicity-client.service
+    dst: /usr/lib/systemd/system/zuicity-client.service
+    file_info:
+      mode: 0644
+  - src: ./install/zuicity-server.service
+    dst: /usr/lib/systemd/system/zuicity-server.service
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: ./packaging/systemd/postinstall.sh
+  postremove: ./packaging/systemd/postremove.sh
+
+deb:
+  depends:
+    - ca-certificates
+  fields:
+    Bugs: https://github.com/teracoot/zuicity/issues
+
+rpm:
+  group: Applications/Internet
+  compression: zstd
+  depends:
+    - ca-certificates
+
+apk:
+  depends:
+    - ca-certificates

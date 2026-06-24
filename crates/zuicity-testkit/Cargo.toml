@@ -1,0 +1,19 @@
+[package]
+name = "zuicity-testkit"
+description = "Interop fixtures and harness helpers for Zuicity parity tests."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rcgen.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zuicity-config = { path = "../zuicity-config" }
+zuicity-protocol = { path = "../zuicity-protocol" }

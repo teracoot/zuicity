@@ -1,0 +1,27 @@
+[package]
+name = "zuicity-dae"
+description = "zae facing Zuicity outbound/runtime adapter boundaries."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zuicity-client = { path = "../zuicity-client" }
+zuicity-config = { path = "../zuicity-config" }
+zuicity-protocol = { path = "../zuicity-protocol" }
+zuicity-transport = { path = "../zuicity-transport" }
+
+[dev-dependencies]
+anyhow.workspace = true
+zuicity-server = { path = "../zuicity-server" }
+zuicity-testkit = { path = "../zuicity-testkit" }
+rcgen.workspace = true

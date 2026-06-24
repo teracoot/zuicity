@@ -1,0 +1,26 @@
+[package]
+name = "zuicity-client"
+description = "Embeddable Zuicity client runtime."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zuicity-config = { path = "../zuicity-config" }
+zuicity-protocol = { path = "../zuicity-protocol" }
+zuicity-transport = { path = "../zuicity-transport" }
+
+uuid.workspace = true
+[dev-dependencies]
+zuicity-server = { path = "../zuicity-server" }
+zuicity-testkit = { path = "../zuicity-testkit" }
+rcgen.workspace = true

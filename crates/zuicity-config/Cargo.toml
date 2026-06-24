@@ -1,0 +1,21 @@
+[package]
+name = "zuicity-config"
+description = "Zuicity JSON configuration model and validation."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+zuicity-protocol = { path = "../zuicity-protocol" }

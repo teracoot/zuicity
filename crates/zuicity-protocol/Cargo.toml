@@ -1,0 +1,20 @@
+[package]
+name = "zuicity-protocol"
+description = "Zuicity wire protocol types, codecs, and authentication helpers."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+rustls-pemfile.workspace = true
+uuid.workspace = true

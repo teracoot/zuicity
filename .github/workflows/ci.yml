@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "scripts/**"
+      - "packaging/**"
+      - "install/**"
+      - "docs/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_JUICITY_DIR: ${{ github.workspace }}/upstream/juicity
+      UPSTREAM_JUICITY_BIN_DIR: ${{ github.workspace }}/upstream/juicity-bin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream Juicity
+        uses: actions/checkout@v4
+        with:
+          repository: juicity/juicity
+          path: upstream/juicity
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fakeroot jq zip rpm libarchive-tools
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/juicity/go.mod
+          cache-dependency-path: upstream/juicity/go.sum
+
+      - name: Build upstream Juicity binaries
+        run: |
+          mkdir -p "$UPSTREAM_JUICITY_BIN_DIR"
+          go -C "$UPSTREAM_JUICITY_DIR" build -o "$UPSTREAM_JUICITY_BIN_DIR/juicity-client" ./cmd/client
+          go -C "$UPSTREAM_JUICITY_DIR" build -o "$UPSTREAM_JUICITY_BIN_DIR/juicity-server" ./cmd/server
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Workspace check
+        run: cargo check --workspace --all-targets
+
+      - name: Workspace tests
+        run: cargo test --workspace --all-targets --exclude zuicity-benchmarks
+
+      - name: Benchmark smoke tests
+        run: cargo test -p zuicity-benchmarks --test first_slice_smoke -- --nocapture --test-threads=1
+
+      - name: Build dialer_link differential oracle
+        run: |
+          cd differential/oracle
+          go build -o dialer-link-oracle .
+
+      - name: Dialer_link differential parity tests
+        env:
+          ZUICITY_DIALER_ORACLE: ${{ github.workspace }}/differential/oracle/dialer-link-oracle
+        run: cargo test -p zuicity-transport --test dialer_link_differential -- --nocapture
+
+      - name: Validate packaging files
+        run: scripts/validate-packaging.py
+
+      - name: Local release package smoke
+        run: scripts/package-release.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-package --version "ci-${{ github.sha }}"
+
+      - name: Local Debian package smoke
+        run: scripts/package-deb-smoke.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-deb-smoke --version "ci-${{ github.sha }}" --skip-build
+
+      - name: Local RPM package smoke
+        run: scripts/package-rpm-smoke.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-rpm-smoke --version "ci-${{ github.sha }}" --skip-build
+
+      - name: Local APK package smoke
+        run: scripts/package-apk-smoke.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-apk-smoke --version "ci-${{ github.sha }}" --skip-build
+
+      - name: Local deployment smoke
+        run: scripts/deployment-smoke.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-deployment-smoke --version "ci-${{ github.sha }}" --duration 3 --skip-build
+
+      - name: Local release packaging benchmark
+        run: scripts/benchmark-package-release.sh --target x86_64-unknown-linux-gnu --output-dir /tmp/zuicity-package-benchmark --log-dir /tmp/zuicity-package-benchmark-logs --version "ci-benchmark-${{ github.sha }}" --skip-build
+
+  alpine-package:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Install Alpine build and packaging tools
+        run: |
+          apk add --no-cache \
+            alpine-sdk abuild build-base \
+            bash python3 tar gzip sudo curl \
+            rustup
+
+      - name: Configure abuild build user
+        run: |
+          adduser -D -G abuild builder || true
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+      - name: Native APK build, apk add install, and run smoke
+        shell: bash
+        run: |
+          chown -R builder:abuild "$GITHUB_WORKSPACE"
+          su builder -c '
+            set -euo pipefail
+            cd "'"$GITHUB_WORKSPACE"'"
+            abuild-keygen -a -n
+            # Alpine 3.20 ships cargo 1.78, which cannot parse edition 2024 /
+            # resolver 3. Install a pinned stable toolchain via rustup instead.
+            rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.96.0
+            export PATH="$HOME/.cargo/bin:$PATH"
+            rustup target add x86_64-unknown-linux-musl
+            cargo --version
+            scripts/package-apk-native.sh \
+              --target x86_64-unknown-linux-musl \
+              --output-dir /tmp/zuicity-apk-native \
+              --version "ci-${{ github.sha }}"
+          '
+          echo "Installing the built package as root via apk add"
+          APK_FILE="$(find /tmp/zuicity-apk-native/packages -name 'zuicity-*.apk' | head -1)"
+          test -n "$APK_FILE"
+          apk add --allow-untrusted "$APK_FILE"
+          /usr/bin/zuicity-client -v
+          /usr/bin/zuicity-server -v
+          apk info -e zuicity
+

@@ -1,0 +1,18 @@
+{
+  "x86_64-unknown-linux-gnu": { "friendlyName": "linux-x86_64" },
+  "i686-unknown-linux-gnu": { "friendlyName": "linux-x86_32" },
+  "aarch64-unknown-linux-gnu": { "friendlyName": "linux-arm64" },
+  "armv7-unknown-linux-gnueabihf": { "friendlyName": "linux-armv7" },
+  "arm-unknown-linux-gnueabihf": { "friendlyName": "linux-armv6" },
+  "arm-unknown-linux-gnueabi": { "friendlyName": "linux-armv5" },
+  "mips-unknown-linux-gnu": { "friendlyName": "linux-mips32" },
+  "mipsel-unknown-linux-gnu": { "friendlyName": "linux-mips32le" },
+  "mips64-unknown-linux-gnuabi64": { "friendlyName": "linux-mips64" },
+  "mips64el-unknown-linux-gnuabi64": { "friendlyName": "linux-mips64le" },
+  "riscv64gc-unknown-linux-gnu": { "friendlyName": "linux-riscv64" },
+  "x86_64-apple-darwin": { "friendlyName": "macos-x86_64" },
+  "aarch64-apple-darwin": { "friendlyName": "macos-arm64" },
+  "x86_64-pc-windows-msvc": { "friendlyName": "windows-x86_64" },
+  "aarch64-pc-windows-msvc": { "friendlyName": "windows-arm64" },
+  "aarch64-linux-android": { "friendlyName": "android-arm64" }
+}

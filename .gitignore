@@ -1,0 +1,9 @@
+/target/
+/tmp/
+*.log
+.DS_Store
+/criterion/
+/.idea/
+/.vscode/
+/benchmark-results/
+__pycache__/

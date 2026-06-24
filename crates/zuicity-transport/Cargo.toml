@@ -1,0 +1,51 @@
+[package]
+name = "zuicity-transport"
+description = "QUIC/TLS transport abstractions for Zuicity runtimes."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+md5.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+sha1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+shadowsocks.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
+uuid.workspace = true
+zuicity-protocol = { path = "../zuicity-protocol" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+zuicity-config = { path = "../zuicity-config" }
+zuicity-testkit = { path = "../zuicity-testkit" }
+proptest.workspace = true
+rcgen.workspace = true

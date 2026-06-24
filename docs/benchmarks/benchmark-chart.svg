@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="566" viewBox="0 0 800 566" font-family="DejaVu Sans, Arial, sans-serif">
+<rect width="800" height="566" fill="#ffffff"/>
+<text x="400.0" y="26" text-anchor="middle" font-size="20" font-weight="700" fill="#111">zuicity QUIC proxy: performance comparison</text>
+<text x="400.0" y="44" text-anchor="middle" font-size="11" fill="#666">two-namespace veth benchmark, median of 5 reps (lower RTT / higher throughput = better)</text>
+<text x="210.0" y="74.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1b1b1b">TCP connect+RTT (ms)</text>
+<text x="210.0" y="87.0" text-anchor="middle" font-size="10" fill="#777">lower is better</text>
+<line x1="28.0" y1="238.0" x2="392.0" y2="238.0" stroke="#ccc" stroke-width="1"/>
+<rect x="54.8" y="233.4" width="67.9" height="4.6" rx="3" fill="#2f6f4f"/>
+<text x="88.7" y="228.4" text-anchor="middle" font-size="11" font-weight="600" fill="#222">0.96</text>
+<text x="88.7" y="254.0" text-anchor="middle" font-size="10" fill="#333">zuicity (this</text>
+<text x="88.7" y="266.0" text-anchor="middle" font-size="10" fill="#333">port)</text>
+<rect x="176.1" y="232.5" width="67.9" height="5.5" rx="3" fill="#3060a8"/>
+<text x="210.0" y="227.5" text-anchor="middle" font-size="11" font-weight="600" fill="#222">1.15</text>
+<text x="210.0" y="254.0" text-anchor="middle" font-size="10" fill="#333">juicity (Go</text>
+<text x="210.0" y="266.0" text-anchor="middle" font-size="10" fill="#333">upstream)</text>
+<rect x="297.4" y="100.0" width="67.9" height="138.0" rx="3" fill="#9a5b2e"/>
+<text x="331.3" y="95.0" text-anchor="middle" font-size="11" font-weight="600" fill="#222">29.04</text>
+<text x="331.3" y="254.0" text-anchor="middle" font-size="10" fill="#333">juicity-rs</text>
+<text x="331.3" y="266.0" text-anchor="middle" font-size="10" fill="#333">(other)</text>
+<text x="590.0" y="74.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1b1b1b">TCP persistent RTT (ms)</text>
+<text x="590.0" y="87.0" text-anchor="middle" font-size="10" fill="#777">lower is better</text>
+<line x1="408.0" y1="238.0" x2="772.0" y2="238.0" stroke="#ccc" stroke-width="1"/>
+<rect x="434.8" y="143.7" width="67.9" height="94.3" rx="3" fill="#2f6f4f"/>
+<text x="468.7" y="138.7" text-anchor="middle" font-size="11" font-weight="600" fill="#222">0.41</text>
+<text x="468.7" y="254.0" text-anchor="middle" font-size="10" fill="#333">zuicity (this</text>
+<text x="468.7" y="266.0" text-anchor="middle" font-size="10" fill="#333">port)</text>
+<rect x="556.0" y="100.0" width="67.9" height="138.0" rx="3" fill="#3060a8"/>
+<text x="590.0" y="95.0" text-anchor="middle" font-size="11" font-weight="600" fill="#222">0.60</text>
+<text x="590.0" y="254.0" text-anchor="middle" font-size="10" fill="#333">juicity (Go</text>
+<text x="590.0" y="266.0" text-anchor="middle" font-size="10" fill="#333">upstream)</text>
+<rect x="677.3" y="125.3" width="67.9" height="112.7" rx="3" fill="#9a5b2e"/>
+<text x="711.3" y="120.3" text-anchor="middle" font-size="11" font-weight="600" fill="#222">0.49</text>
+<text x="711.3" y="254.0" text-anchor="middle" font-size="10" fill="#333">juicity-rs</text>
+<text x="711.3" y="266.0" text-anchor="middle" font-size="10" fill="#333">(other)</text>
+<text x="210.0" y="314.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1b1b1b">TCP throughput (Mbps)</text>
+<text x="210.0" y="327.0" text-anchor="middle" font-size="10" fill="#777">higher is better</text>
+<line x1="28.0" y1="478.0" x2="392.0" y2="478.0" stroke="#ccc" stroke-width="1"/>
+<rect x="54.8" y="340.0" width="67.9" height="138.0" rx="3" fill="#2f6f4f"/>
+<text x="88.7" y="335.0" text-anchor="middle" font-size="11" font-weight="600" fill="#222">621</text>
+<text x="88.7" y="494.0" text-anchor="middle" font-size="10" fill="#333">zuicity (this</text>
+<text x="88.7" y="506.0" text-anchor="middle" font-size="10" fill="#333">port)</text>
+<rect x="176.1" y="399.6" width="67.9" height="78.4" rx="3" fill="#3060a8"/>
+<text x="210.0" y="394.6" text-anchor="middle" font-size="11" font-weight="600" fill="#222">353</text>
+<text x="210.0" y="494.0" text-anchor="middle" font-size="10" fill="#333">juicity (Go</text>
+<text x="210.0" y="506.0" text-anchor="middle" font-size="10" fill="#333">upstream)</text>
+<rect x="297.4" y="476.1" width="67.9" height="1.9" rx="3" fill="#9a5b2e"/>
+<text x="331.3" y="471.1" text-anchor="middle" font-size="11" font-weight="600" fill="#222">8.57</text>
+<text x="331.3" y="494.0" text-anchor="middle" font-size="10" fill="#333">juicity-rs</text>
+<text x="331.3" y="506.0" text-anchor="middle" font-size="10" fill="#333">(other)</text>
+<text x="590.0" y="314.0" text-anchor="middle" font-size="15" font-weight="700" fill="#1b1b1b">UDP RTT (ms)</text>
+<text x="590.0" y="327.0" text-anchor="middle" font-size="10" fill="#777">lower is better</text>
+<line x1="408.0" y1="478.0" x2="772.0" y2="478.0" stroke="#ccc" stroke-width="1"/>
+<rect x="434.8" y="429.1" width="67.9" height="48.9" rx="3" fill="#2f6f4f"/>
+<text x="468.7" y="424.1" text-anchor="middle" font-size="11" font-weight="600" fill="#222">10.35</text>
+<text x="468.7" y="494.0" text-anchor="middle" font-size="10" fill="#333">zuicity (this</text>
+<text x="468.7" y="506.0" text-anchor="middle" font-size="10" fill="#333">port)</text>
+<rect x="556.0" y="429.1" width="67.9" height="48.9" rx="3" fill="#3060a8"/>
+<text x="590.0" y="424.1" text-anchor="middle" font-size="11" font-weight="600" fill="#222">10.35</text>
+<text x="590.0" y="494.0" text-anchor="middle" font-size="10" fill="#333">juicity (Go</text>
+<text x="590.0" y="506.0" text-anchor="middle" font-size="10" fill="#333">upstream)</text>
+<rect x="677.3" y="340.0" width="67.9" height="138.0" rx="3" fill="#9a5b2e"/>
+<text x="711.3" y="335.0" text-anchor="middle" font-size="11" font-weight="600" fill="#222">29.20</text>
+<text x="711.3" y="494.0" text-anchor="middle" font-size="10" fill="#333">juicity-rs</text>
+<text x="711.3" y="506.0" text-anchor="middle" font-size="10" fill="#333">(other)</text>
+</svg>

@@ -1,0 +1,43 @@
+[package]
+name = "zuicity-cli"
+description = "Zuicity command-line binaries."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zuicity-client"
+path = "src/bin/zuicity-client.rs"
+
+[[bin]]
+name = "zuicity-server"
+path = "src/bin/zuicity-server.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+time.workspace = true
+zuicity-client = { path = "../zuicity-client" }
+zuicity-config = { path = "../zuicity-config" }
+zuicity-protocol = { path = "../zuicity-protocol" }
+zuicity-server = { path = "../zuicity-server" }
+zuicity-transport = { path = "../zuicity-transport" }
+rustls-pemfile.workspace = true
+url.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+zuicity-testkit = { path = "../zuicity-testkit" }
+rcgen.workspace = true
+uuid.workspace = true
+shadowsocks.workspace = true
