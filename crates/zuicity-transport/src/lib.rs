@@ -11177,6 +11177,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rust_server_rejects_unknown_uuid_authentication() -> Result<(), TransportError> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let server_uuid = uuid::Uuid::new_v4();
+        let client_uuid = uuid::Uuid::new_v4();
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+
+        let server_task = tokio::spawn(async move {
+            server
+                .accept_authenticated(server_uuid, b"shared-password")
+                .await
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let _connection = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                client_uuid,
+                b"shared-password",
+            )
+            .await?;
+
+        let error = server_task
+            .await
+            .expect("server task joins")
+            .expect_err("unknown uuid is rejected");
+        assert!(matches!(error, TransportError::AuthenticationRejected));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rust_rust_tcp_proxy_stream_reaches_domain_echo_target() -> Result<(), TransportError> {
         let echo = zuicity_testkit::TcpEchoServer::start()
             .await
