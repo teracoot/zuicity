@@ -622,9 +622,7 @@ impl MixedTcpListener {
                     .await
             }
             TcpForwardTarget::Domain { domain, port } => {
-                connection
-                    .open_tcp_proxy_domain_stream(domain, *port)
-                    .await
+                connection.open_tcp_proxy_domain_stream(domain, *port).await
             }
         };
         match result {
@@ -686,9 +684,7 @@ impl MixedTcpRelayRuntime {
                     .await
             }
             TcpForwardTarget::Domain { domain, port } => {
-                connection
-                    .open_tcp_proxy_domain_stream(domain, *port)
-                    .await
+                connection.open_tcp_proxy_domain_stream(domain, *port).await
             }
         };
         match result {
