@@ -10,8 +10,9 @@ use std::{
 use zuicity_config::ServerConfig;
 use zuicity_protocol::AtomicCounter64;
 use zuicity_transport::{
-    DEFAULT_NAT_TIMEOUT, JuicityQuicServer, ProxyEgressPolicy, ProxyRelayReport, StreamPolicy,
-    TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
+    DEFAULT_NAT_TIMEOUT, JuicityQuicServer, ProxyEgressPolicy, ProxyProtocol, ProxyRelayReport,
+    StreamPolicy, TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
+    run_tuic_udp_datagram_relay,
 };
 
 const PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
@@ -807,6 +808,24 @@ async fn run_authenticated_proxy_connection_until(
     let mut report = ServerProxyLoopReport::default();
     let mut relays = tokio::task::JoinSet::new();
 
+    let tuic_udp_relay = if connection.protocol() == ProxyProtocol::Tuic {
+        let quic = connection.as_quinn().clone();
+        let relay_egress = egress.clone();
+        let mut relay_shutdown = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let shutdown_signal = async move {
+                while relay_shutdown.changed().await.is_ok() {
+                    if *relay_shutdown.borrow() {
+                        break;
+                    }
+                }
+            };
+            run_tuic_udp_datagram_relay(quic, relay_egress, shutdown_signal).await
+        }))
+    } else {
+        None
+    };
+
     let shutdown_requested = loop {
         tokio::select! {
             biased;
@@ -851,6 +870,9 @@ async fn run_authenticated_proxy_connection_until(
         while let Some(relay) = relays.join_next().await {
             record_proxy_connection_result(&mut report, &hooks, relay?);
         }
+    }
+    if let Some(handle) = tuic_udp_relay {
+        handle.abort();
     }
     Ok(report)
 }

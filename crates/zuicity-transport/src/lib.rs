@@ -82,6 +82,12 @@ const TUIC_COMMAND_PACKET: u8 = 0x02;
 /// Upstream TUIC UDP association close command type.
 const TUIC_COMMAND_DISSOCIATE: u8 = 0x03;
 
+/// Upstream TUIC heartbeat command type (datagram, two bytes, no payload).
+const TUIC_COMMAND_HEARTBEAT: u8 = 0x04;
+
+/// Maximum bytes accepted from a single TUIC UDP-over-stream command.
+const TUIC_UNI_STREAM_MAX_LEN: usize = 70_000;
+
 /// Upstream TUIC domain address discriminator.
 const TUIC_ADDR_DOMAIN: u8 = 0x00;
 
@@ -1558,7 +1564,7 @@ impl QuicRuntimePolicy {
             keep_alive: SERVER_KEEP_ALIVE,
             handshake_idle_timeout: None,
             disable_path_mtu_discovery: false,
-            enable_datagrams: false,
+            enable_datagrams: true,
             congestion_controller: CongestionController::Bbr,
             cwnd: UPSTREAM_CWND,
         }
@@ -1609,10 +1615,14 @@ impl BuiltTransportConfig {
         Some(self.policy.keep_alive)
     }
 
-    /// Returns datagram receive-buffer setting; upstream Juicity disables QUIC datagrams.
+    /// Returns the datagram receive-buffer setting derived from the policy.
     #[must_use]
     pub const fn datagram_receive_buffer_size(&self) -> Option<usize> {
-        None
+        if self.policy.enable_datagrams {
+            Some(u16::MAX as usize)
+        } else {
+            None
+        }
     }
 
     /// Converts into a shareable Quinn transport config.
@@ -2669,8 +2679,11 @@ impl JuicityQuicServer {
             .await
             .ok_or(TransportError::EndpointClosed)?;
         let connection = incoming.accept()?.await?;
-        verify_authentication_stream_with(&connection, credentials).await?;
-        Ok(AuthenticatedConnection { connection })
+        let protocol = verify_authentication_stream_with(&connection, credentials).await?;
+        Ok(AuthenticatedConnection {
+            connection,
+            protocol,
+        })
     }
 }
 
@@ -2708,7 +2721,10 @@ impl JuicityQuicClient {
             .connect_with(config.inner, server_addr, server_name)?
             .await?;
         send_authentication_stream(&connection, uuid, password).await?;
-        Ok(AuthenticatedConnection { connection })
+        Ok(AuthenticatedConnection {
+            connection,
+            protocol: ProxyProtocol::Juicity,
+        })
     }
 
     /// Connects using upstream-style pinned certificate-chain verification.
@@ -2726,14 +2742,27 @@ impl JuicityQuicClient {
             .connect_with(config.inner, server_addr, server_name)?
             .await?;
         send_authentication_stream(&connection, uuid, password).await?;
-        Ok(AuthenticatedConnection { connection })
+        Ok(AuthenticatedConnection {
+            connection,
+            protocol: ProxyProtocol::Juicity,
+        })
     }
+}
+
+/// Wire protocol negotiated on the authentication stream.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProxyProtocol {
+    /// Juicity authentication frame (version byte `0x00`).
+    Juicity,
+    /// TUIC v5 authentication frame (version byte `0x05`).
+    Tuic,
 }
 
 /// Authenticated Juicity QUIC connection wrapper.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedConnection {
     connection: quinn::Connection,
+    protocol: ProxyProtocol,
 }
 
 impl AuthenticatedConnection {
@@ -2747,6 +2776,12 @@ impl AuthenticatedConnection {
     #[must_use]
     pub fn as_quinn(&self) -> &quinn::Connection {
         &self.connection
+    }
+
+    /// Returns the negotiated wire protocol for this connection.
+    #[must_use]
+    pub fn protocol(&self) -> ProxyProtocol {
+        self.protocol
     }
 
     /// Opens one upstream-compatible TCP proxy bidirectional stream.
@@ -2843,7 +2878,10 @@ impl AuthenticatedConnection {
     /// upstream Go server which spawns one goroutine per accepted stream.
     pub async fn accept_proxy_stream(&self) -> Result<AcceptedProxyStream, TransportError> {
         let (send, mut recv) = self.connection.accept_bi().await?;
-        let (header, initial_payload) = read_proxy_header_prefix(&mut recv).await?;
+        let (header, initial_payload) = match self.protocol {
+            ProxyProtocol::Juicity => read_proxy_header_prefix(&mut recv).await?,
+            ProxyProtocol::Tuic => read_tuic_connect_header_prefix(&mut recv).await?,
+        };
         Ok(AcceptedProxyStream {
             send,
             recv,
@@ -5068,7 +5106,10 @@ async fn connect_juicity_dialer_link(
         .connect_with(config.inner, proxy_target, &link.sni)?
         .await?;
     send_authentication_stream(&connection, link.uuid, link.password.as_bytes()).await?;
-    Ok(AuthenticatedConnection { connection })
+    Ok(AuthenticatedConnection {
+        connection,
+        protocol: ProxyProtocol::Juicity,
+    })
 }
 
 async fn open_juicity_tcp_proxy_stream(
@@ -6760,6 +6801,93 @@ fn encode_tuic_udp_packet(
     Ok(packet)
 }
 
+fn encode_tuic_udp_fragment(
+    header: &OwnedProxyHeader,
+    payload: &[u8],
+    association_id: u16,
+    packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
+    include_address: bool,
+) -> Result<Vec<u8>, TransportError> {
+    let payload_len = u16::try_from(payload.len()).map_err(|_| TransportError::TuicProxy {
+        stage: "packet",
+        message: "UDP payload exceeds TUIC u16 packet size".to_owned(),
+    })?;
+    let mut packet = Vec::with_capacity(TUIC_UDP_PACKET_FIXED_LEN + 1 + payload.len());
+    packet.push(TUIC_VERSION_5);
+    packet.push(TUIC_COMMAND_PACKET);
+    packet.extend_from_slice(&association_id.to_be_bytes());
+    packet.extend_from_slice(&packet_id.to_be_bytes());
+    packet.push(fragment_total);
+    packet.push(fragment_id);
+    packet.extend_from_slice(&payload_len.to_be_bytes());
+    if include_address {
+        encode_tuic_target(header, &mut packet)?;
+    } else {
+        packet.push(TUIC_ADDR_NONE);
+    }
+    packet.extend_from_slice(payload);
+    Ok(packet)
+}
+
+fn encode_tuic_udp_fragments(
+    header: &OwnedProxyHeader,
+    payload: &[u8],
+    association_id: u16,
+    packet_id: u16,
+    max_datagram_size: usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    if header.network != Network::Udp {
+        return Err(TransportError::UnexpectedProxyNetwork(header.network));
+    }
+    let first_budget = max_datagram_size
+        .saturating_sub(TUIC_UDP_PACKET_FIXED_LEN + tuic_target_encoded_len(header)?);
+    let other_budget = max_datagram_size.saturating_sub(TUIC_UDP_PACKET_FIXED_LEN + 1);
+    if first_budget == 0 || other_budget == 0 {
+        return Err(tuic_packet_error("datagram size too small for TUIC packet"));
+    }
+
+    if payload.len() <= first_budget {
+        return Ok(vec![encode_tuic_udp_fragment(
+            header,
+            payload,
+            association_id,
+            packet_id,
+            1,
+            0,
+            true,
+        )?]);
+    }
+
+    let extra_fragments = (payload.len() - first_budget).div_ceil(other_budget);
+    let fragment_total_usize = 1 + extra_fragments;
+    let fragment_total = u8::try_from(fragment_total_usize)
+        .map_err(|_| tuic_packet_error("TUIC reply needs more than 255 fragments"))?;
+
+    let mut fragments = Vec::with_capacity(fragment_total_usize);
+    let mut offset = 0;
+    for fragment_id in 0..fragment_total {
+        let budget = if fragment_id == 0 {
+            first_budget
+        } else {
+            other_budget
+        };
+        let end = (offset + budget).min(payload.len());
+        fragments.push(encode_tuic_udp_fragment(
+            header,
+            &payload[offset..end],
+            association_id,
+            packet_id,
+            fragment_total,
+            fragment_id,
+            fragment_id == 0,
+        )?);
+        offset = end;
+    }
+    Ok(fragments)
+}
+
 fn tuic_target_encoded_len(header: &OwnedProxyHeader) -> Result<usize, TransportError> {
     Ok(match &header.address {
         OwnedProxyAddress::Ipv4(_) => 1 + 4 + 2,
@@ -6808,6 +6936,60 @@ fn decode_tuic_udp_packet(
     Ok(TuicUdpPacket {
         association_id,
         packet_id,
+        target,
+        payload: datagram[payload_offset..end].to_vec(),
+    })
+}
+
+struct TuicUdpFragment {
+    association_id: u16,
+    packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
+    target: Option<SocketAddr>,
+    payload: Vec<u8>,
+}
+
+fn decode_tuic_udp_fragment(datagram: &[u8]) -> Result<TuicUdpFragment, TransportError> {
+    if datagram.len() < TUIC_UDP_PACKET_FIXED_LEN {
+        return Err(tuic_packet_error("truncated packet header"));
+    }
+    if datagram[0] != TUIC_VERSION_5 || datagram[1] != TUIC_COMMAND_PACKET {
+        return Err(tuic_packet_error(format!(
+            "unexpected packet head {:02x?}",
+            &datagram[..2]
+        )));
+    }
+    let association_id = u16::from_be_bytes([datagram[2], datagram[3]]);
+    let packet_id = u16::from_be_bytes([datagram[4], datagram[5]]);
+    let fragment_total = datagram[6];
+    let fragment_id = datagram[7];
+    if fragment_total == 0 || fragment_id >= fragment_total {
+        return Err(tuic_packet_error("invalid TUIC fragment index"));
+    }
+    let payload_len = usize::from(u16::from_be_bytes([datagram[8], datagram[9]]));
+    let (target, payload_offset) = if fragment_id == 0 {
+        let (target, offset) = decode_tuic_udp_target(datagram, TUIC_UDP_PACKET_FIXED_LEN)?;
+        (Some(target), offset)
+    } else {
+        if datagram.get(TUIC_UDP_PACKET_FIXED_LEN) != Some(&TUIC_ADDR_NONE) {
+            return Err(tuic_packet_error(
+                "non-first TUIC fragment must use the none address",
+            ));
+        }
+        (None, TUIC_UDP_PACKET_FIXED_LEN + 1)
+    };
+    let end = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| tuic_packet_error("packet payload length overflow"))?;
+    if datagram.len() != end {
+        return Err(tuic_packet_error("packet payload length mismatch"));
+    }
+    Ok(TuicUdpFragment {
+        association_id,
+        packet_id,
+        fragment_total,
+        fragment_id,
         target,
         payload: datagram[payload_offset..end].to_vec(),
     })
@@ -6891,6 +7073,311 @@ fn tuic_send_datagram_error(error: quinn::SendDatagramError) -> TransportError {
     TransportError::TuicProxy {
         stage: "datagram",
         message: error.to_string(),
+    }
+}
+
+struct TuicUdpAssocHandle {
+    sender: tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct TuicUdpReassemblyBuffer {
+    fragments: Vec<Option<Vec<u8>>>,
+    received: u8,
+    target: Option<SocketAddr>,
+    created: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct TuicUdpReassembler {
+    buffers: HashMap<(u16, u16), TuicUdpReassemblyBuffer>,
+}
+
+impl TuicUdpReassembler {
+    fn accept(
+        &mut self,
+        fragment: TuicUdpFragment,
+    ) -> Result<Option<(Vec<u8>, SocketAddr)>, TransportError> {
+        if fragment.fragment_total == 1 {
+            let target = fragment
+                .target
+                .ok_or_else(|| tuic_packet_error("first TUIC fragment is missing its address"))?;
+            return Ok(Some((fragment.payload, target)));
+        }
+
+        let key = (fragment.association_id, fragment.packet_id);
+        let buffer = self
+            .buffers
+            .entry(key)
+            .or_insert_with(|| TuicUdpReassemblyBuffer {
+                fragments: vec![None; fragment.fragment_total as usize],
+                received: 0,
+                target: None,
+                created: tokio::time::Instant::now(),
+            });
+        if buffer.fragments.len() != fragment.fragment_total as usize {
+            self.buffers.remove(&key);
+            return Err(tuic_packet_error("TUIC fragment total changed mid-packet"));
+        }
+        let slot = &mut buffer.fragments[fragment.fragment_id as usize];
+        if slot.is_some() {
+            return Err(tuic_packet_error("duplicate TUIC fragment"));
+        }
+        if fragment.fragment_id == 0 {
+            buffer.target =
+                Some(fragment.target.ok_or_else(|| {
+                    tuic_packet_error("first TUIC fragment is missing its address")
+                })?);
+        }
+        *slot = Some(fragment.payload);
+        buffer.received += 1;
+
+        if usize::from(buffer.received) == buffer.fragments.len() {
+            let buffer = self.buffers.remove(&key).expect("buffer present");
+            let target = buffer
+                .target
+                .ok_or_else(|| tuic_packet_error("reassembled TUIC packet has no address"))?;
+            let mut payload = Vec::new();
+            for chunk in buffer.fragments {
+                payload.extend_from_slice(&chunk.expect("all fragments present"));
+            }
+            return Ok(Some((payload, target)));
+        }
+        Ok(None)
+    }
+
+    fn collect_garbage(&mut self) {
+        self.buffers
+            .retain(|_, buffer| buffer.created.elapsed() < DEFAULT_NAT_TIMEOUT);
+    }
+}
+
+/// Relays TUIC v5 native-UDP datagrams for one authenticated connection until
+/// the connection closes or `shutdown` resolves.
+pub async fn run_tuic_udp_datagram_relay(
+    connection: quinn::Connection,
+    egress: ProxyEgressPolicy,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), TransportError> {
+    tokio::pin!(shutdown);
+    let mut associations: HashMap<u16, TuicUdpAssocHandle> = HashMap::new();
+    let mut reassembler = TuicUdpReassembler::default();
+    let mut logged_decode_drop = false;
+    let mut gc = tokio::time::interval(DEFAULT_NAT_TIMEOUT);
+    gc.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            _ = gc.tick() => {
+                reassembler.collect_garbage();
+            }
+            uni = connection.accept_uni() => {
+                let Ok(mut recv) = uni else { break };
+                let Ok(raw) = recv.read_to_end(TUIC_UNI_STREAM_MAX_LEN).await else {
+                    continue;
+                };
+                if raw.len() < 2 || raw[0] != TUIC_VERSION_5 {
+                    continue;
+                }
+                match raw[1] {
+                    TUIC_COMMAND_DISSOCIATE if raw.len() >= 4 => {
+                        let association_id = u16::from_be_bytes([raw[2], raw[3]]);
+                        if let Some(handle) = associations.remove(&association_id) {
+                            handle.task.abort();
+                        }
+                    }
+                    TUIC_COMMAND_PACKET => {
+                        let fragment = match decode_tuic_udp_fragment(&raw) {
+                            Ok(fragment) => fragment,
+                            Err(error) => {
+                                if !logged_decode_drop {
+                                    logged_decode_drop = true;
+                                    tracing::debug!(error = %error, "tuicUdpDropStream");
+                                }
+                                continue;
+                            }
+                        };
+                        let association_id = fragment.association_id;
+                        match reassembler.accept(fragment) {
+                            Ok(Some(forward)) => {
+                                forward_tuic_udp(
+                                    &connection,
+                                    &egress,
+                                    &mut associations,
+                                    association_id,
+                                    forward,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if !logged_decode_drop {
+                                    logged_decode_drop = true;
+                                    tracing::debug!(error = %error, "tuicUdpDropStream");
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            datagram = connection.read_datagram() => {
+                let datagram = match datagram {
+                    Ok(datagram) => datagram,
+                    Err(_) => break,
+                };
+                if datagram.len() >= 2
+                    && datagram[0] == TUIC_VERSION_5
+                    && datagram[1] == TUIC_COMMAND_HEARTBEAT
+                {
+                    continue;
+                }
+                let fragment = match decode_tuic_udp_fragment(&datagram) {
+                    Ok(fragment) => fragment,
+                    Err(error) => {
+                        if !logged_decode_drop {
+                            logged_decode_drop = true;
+                            tracing::debug!(error = %error, "tuicUdpDropDatagram");
+                        }
+                        continue;
+                    }
+                };
+                let association_id = fragment.association_id;
+                let forward = match reassembler.accept(fragment) {
+                    Ok(Some(forward)) => forward,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        if !logged_decode_drop {
+                            logged_decode_drop = true;
+                            tracing::debug!(error = %error, "tuicUdpDropDatagram");
+                        }
+                        continue;
+                    }
+                };
+                forward_tuic_udp(
+                    &connection,
+                    &egress,
+                    &mut associations,
+                    association_id,
+                    forward,
+                )
+                .await;
+            }
+        }
+    }
+    for (_, handle) in associations.drain() {
+        handle.task.abort();
+    }
+    Ok(())
+}
+
+async fn forward_tuic_udp(
+    connection: &quinn::Connection,
+    egress: &ProxyEgressPolicy,
+    associations: &mut HashMap<u16, TuicUdpAssocHandle>,
+    association_id: u16,
+    forward: (Vec<u8>, SocketAddr),
+) {
+    if let Some(handle) = associations.get(&association_id) {
+        if handle.sender.send(forward.clone()).await.is_ok() {
+            return;
+        }
+        if let Some(stale) = associations.remove(&association_id) {
+            stale.task.abort();
+        }
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(run_tuic_udp_association(
+        connection.clone(),
+        egress.clone(),
+        association_id,
+        receiver,
+    ));
+    let _ = sender.send(forward).await;
+    associations.insert(association_id, TuicUdpAssocHandle { sender, task });
+}
+
+async fn run_tuic_udp_association(
+    connection: quinn::Connection,
+    egress: ProxyEgressPolicy,
+    association_id: u16,
+    mut receiver: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+) {
+    let mut relay_socket: Option<(bool, tokio::net::UdpSocket)> = None;
+    let mut packet_id: u16 = 0;
+    let mut response = vec![0_u8; 65_535];
+    let mut logged_oversize = false;
+    loop {
+        let socket_recv = async {
+            match relay_socket.as_ref() {
+                Some((_, socket)) => socket.recv_from(&mut response).await.map(Some),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            inbound = receiver.recv() => {
+                let Some((payload, target)) = inbound else {
+                    break;
+                };
+                if egress_source_mismatches_target(&egress, target) {
+                    continue;
+                }
+                let target_is_ipv4 = target.is_ipv4();
+                let needs_socket = match relay_socket {
+                    Some((socket_is_ipv4, _)) => socket_is_ipv4 != target_is_ipv4,
+                    None => true,
+                };
+                if needs_socket {
+                    let bind_addr = udp_relay_bind_addr(target_is_ipv4, &egress);
+                    let Ok(socket) = tokio::net::UdpSocket::bind(bind_addr).await else {
+                        continue;
+                    };
+                    if apply_socket_fwmark(&socket, &egress).is_err() {
+                        continue;
+                    }
+                    relay_socket = Some((target_is_ipv4, socket));
+                }
+                if let Some((_, socket)) = relay_socket.as_ref() {
+                    let _ = socket.send_to(&payload, target).await;
+                }
+            }
+            received = socket_recv => {
+                let Ok(Some((length, peer))) = received else {
+                    break;
+                };
+                let Some(max_datagram_size) = connection.max_datagram_size() else {
+                    if !logged_oversize {
+                        logged_oversize = true;
+                        tracing::debug!("tuicUdpDatagramDisabled");
+                    }
+                    continue;
+                };
+                let response_header = OwnedProxyHeader::from_ip(Network::Udp, peer.ip(), peer.port());
+                let Ok(fragments) = encode_tuic_udp_fragments(
+                    &response_header,
+                    &response[..length],
+                    association_id,
+                    packet_id,
+                    max_datagram_size,
+                ) else {
+                    continue;
+                };
+                packet_id = packet_id.wrapping_add(1);
+                let mut send_failed = false;
+                for fragment in fragments {
+                    if connection.send_datagram(bytes::Bytes::from(fragment)).is_err() {
+                        send_failed = true;
+                        break;
+                    }
+                }
+                if send_failed {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(DEFAULT_NAT_TIMEOUT) => break,
+        }
     }
 }
 
@@ -7622,6 +8109,65 @@ async fn read_proxy_header_prefix(
     Ok((owned_header, Vec::new()))
 }
 
+async fn read_tuic_connect_header_prefix(
+    recv: &mut quinn::RecvStream,
+) -> Result<(OwnedProxyHeader, Vec<u8>), TransportError> {
+    let mut command = [0_u8; 2];
+    recv.read_exact(&mut command).await?;
+    if command[0] != TUIC_VERSION_5 {
+        return Err(TransportError::TuicProxy {
+            stage: "accept",
+            message: format!("unexpected TUIC version {}", command[0]),
+        });
+    }
+    if command[1] != TUIC_COMMAND_CONNECT {
+        return Err(TransportError::TuicProxy {
+            stage: "accept",
+            message: format!("unsupported TUIC command {}", command[1]),
+        });
+    }
+
+    let mut addr_type = [0_u8; 1];
+    recv.read_exact(&mut addr_type).await?;
+    let address = match addr_type[0] {
+        TUIC_ADDR_IPV4 => {
+            let mut rest = [0_u8; 4];
+            recv.read_exact(&mut rest).await?;
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::from(rest))
+        }
+        TUIC_ADDR_IPV6 => {
+            let mut rest = [0_u8; 16];
+            recv.read_exact(&mut rest).await?;
+            OwnedProxyAddress::Ipv6(std::net::Ipv6Addr::from(rest))
+        }
+        TUIC_ADDR_DOMAIN => {
+            let mut len = [0_u8; 1];
+            recv.read_exact(&mut len).await?;
+            let mut domain = vec![0_u8; len[0] as usize];
+            recv.read_exact(&mut domain).await?;
+            let domain = String::from_utf8(domain).map_err(|_| TransportError::TuicProxy {
+                stage: "accept",
+                message: "TUIC domain target is not valid UTF-8".to_owned(),
+            })?;
+            OwnedProxyAddress::Domain(domain)
+        }
+        other => {
+            return Err(TransportError::TuicProxy {
+                stage: "accept",
+                message: format!("unknown TUIC address type {other}"),
+            });
+        }
+    };
+    let mut port = [0_u8; 2];
+    recv.read_exact(&mut port).await?;
+    let header = OwnedProxyHeader {
+        network: Network::Tcp,
+        address,
+        port: u16::from_be_bytes(port),
+    };
+    Ok((header, Vec::new()))
+}
+
 async fn read_runtime_target_metadata(
     recv: &mut quinn::RecvStream,
     encoded: &mut Vec<u8>,
@@ -7737,22 +8283,63 @@ async fn send_authentication_stream(
 async fn verify_authentication_stream_with<'a>(
     connection: &quinn::Connection,
     credentials: impl IntoIterator<Item = (uuid::Uuid, &'a [u8])>,
-) -> Result<(), TransportError> {
-    let mut stream = connection.accept_uni().await?;
-    let mut payload = [0u8; AUTHENTICATION_FRAME_LEN];
-    stream.read_exact(&mut payload).await?;
-    let (request, rest) = AuthenticationRequest::decode(&payload)?;
-    debug_assert!(rest.is_empty());
-
-    for (uuid, password) in credentials {
-        if request.uuid != uuid {
+) -> Result<ProxyProtocol, TransportError> {
+    let payload = loop {
+        let mut stream = connection.accept_uni().await?;
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await?;
+        let is_auth_frame = head[0] == zuicity_protocol::VERSION_0
+            || (head[0] == TUIC_VERSION_5 && head[1] == TUIC_COMMAND_AUTHENTICATE);
+        if !is_auth_frame {
+            let _ = stream.read_to_end(TUIC_UNI_STREAM_MAX_LEN).await;
             continue;
         }
-        let expected_token = export_connection_authentication_token(connection, uuid, password)?;
-        if request.token == expected_token {
-            return Ok(());
+        let mut payload = [0u8; AUTHENTICATION_FRAME_LEN];
+        payload[..2].copy_from_slice(&head);
+        stream
+            .read_exact(&mut payload[2..AUTHENTICATION_FRAME_LEN])
+            .await?;
+        break payload;
+    };
+
+    let parsed = match payload[0] {
+        zuicity_protocol::VERSION_0 => {
+            let (request, rest) = AuthenticationRequest::decode(&payload)?;
+            debug_assert!(rest.is_empty());
+            Some((ProxyProtocol::Juicity, request.uuid, request.token))
         }
-        break;
+        TUIC_VERSION_5 if payload[1] == TUIC_COMMAND_AUTHENTICATE => {
+            let mut uuid_bytes = [0u8; zuicity_protocol::AUTH_UUID_LEN];
+            uuid_bytes.copy_from_slice(
+                &payload[zuicity_protocol::COMMAND_HEADER_LEN
+                    ..zuicity_protocol::COMMAND_HEADER_LEN + zuicity_protocol::AUTH_UUID_LEN],
+            );
+            let mut token = [0u8; zuicity_protocol::AUTH_TOKEN_LEN];
+            token.copy_from_slice(
+                &payload[zuicity_protocol::COMMAND_HEADER_LEN + zuicity_protocol::AUTH_UUID_LEN
+                    ..AUTHENTICATION_FRAME_LEN],
+            );
+            Some((
+                ProxyProtocol::Tuic,
+                uuid::Uuid::from_bytes(uuid_bytes),
+                token,
+            ))
+        }
+        _ => None,
+    };
+
+    if let Some((protocol, request_uuid, request_token)) = parsed {
+        for (uuid, password) in credentials {
+            if request_uuid != uuid {
+                continue;
+            }
+            let expected_token =
+                export_connection_authentication_token(connection, uuid, password)?;
+            if request_token == expected_token {
+                return Ok(protocol);
+            }
+            break;
+        }
     }
     connection.close(quinn::VarInt::from_u32(1), b"authentication rejected");
     Err(TransportError::AuthenticationRejected)
@@ -8225,7 +8812,7 @@ mod tests {
         assert_eq!(policy.streams.max_incoming_streams, 100);
         assert_eq!(policy.streams.max_incoming_uni_streams, 100);
         assert!(!policy.disable_path_mtu_discovery);
-        assert!(!policy.enable_datagrams);
+        assert!(policy.enable_datagrams);
         assert_eq!(policy.congestion_controller, CongestionController::Bbr);
         assert_eq!(policy.cwnd, 10);
     }
@@ -8301,7 +8888,10 @@ mod tests {
 
         let server = build_transport_config(&QuicRuntimePolicy::upstream_server());
         assert_eq!(server.keep_alive_interval(), Some(SERVER_KEEP_ALIVE));
-        assert!(server.datagram_receive_buffer_size().is_none());
+        assert_eq!(
+            server.datagram_receive_buffer_size(),
+            Some(usize::from(u16::MAX))
+        );
     }
 
     #[tokio::test]
@@ -13278,5 +13868,241 @@ mod tests {
             "no GRO segments counted when GRO is disabled"
         );
         Ok(())
+    }
+
+    #[test]
+    fn tuic_auth_frame_matches_juicity_frame_length() {
+        let uuid = uuid::Uuid::from_bytes([0x11; 16]);
+        let token = [0x22_u8; zuicity_protocol::AUTH_TOKEN_LEN];
+        let mut payload = Vec::new();
+        payload.push(TUIC_VERSION_5);
+        payload.push(TUIC_COMMAND_AUTHENTICATE);
+        payload.extend_from_slice(uuid.as_bytes());
+        payload.extend_from_slice(&token);
+        assert_eq!(payload.len(), AUTHENTICATION_FRAME_LEN);
+    }
+
+    #[test]
+    fn tuic_connect_header_encode_matches_addr_constants() {
+        let header = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+            port: 443,
+        };
+        let mut encoded = Vec::new();
+        encode_tuic_target(&header, &mut encoded).unwrap();
+        assert_eq!(encoded[0], TUIC_ADDR_IPV4);
+        assert_eq!(&encoded[1..5], &[10, 0, 0, 9]);
+        assert_eq!(u16::from_be_bytes([encoded[5], encoded[6]]), 443);
+
+        let domain_header = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Domain("example.com".to_owned()),
+            port: 8080,
+        };
+        let mut domain_encoded = Vec::new();
+        encode_tuic_target(&domain_header, &mut domain_encoded).unwrap();
+        assert_eq!(domain_encoded[0], TUIC_ADDR_DOMAIN);
+        assert_eq!(domain_encoded[1] as usize, "example.com".len());
+        assert_eq!(&domain_encoded[2..2 + 11], b"example.com");
+    }
+
+    #[test]
+    fn tuic_udp_packet_roundtrips_ipv4_target() {
+        let header = OwnedProxyHeader {
+            network: Network::Udp,
+            address: OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            port: 53,
+        };
+        let payload = b"hello udp world";
+        let association_id = 0x1234;
+        let packet_id = 0xabcd;
+
+        let encoded = encode_tuic_udp_packet(&header, payload, association_id, packet_id).unwrap();
+        let decoded = decode_tuic_udp_packet(&encoded, association_id).unwrap();
+
+        assert_eq!(decoded.association_id, association_id);
+        assert_eq!(decoded.packet_id, packet_id);
+        assert_eq!(decoded.target, SocketAddr::from(([8, 8, 8, 8], 53)));
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn tuic_udp_decode_rejects_heartbeat_and_garbage() {
+        let heartbeat = [TUIC_VERSION_5, 0x04, 0x00, 0x00];
+        assert!(decode_tuic_udp_packet(&heartbeat, 0).is_err());
+
+        let garbage = [0xff_u8; 32];
+        let expected = u16::from_be_bytes([garbage[2], garbage[3]]);
+        assert!(decode_tuic_udp_packet(&garbage, expected).is_err());
+
+        let truncated = [TUIC_VERSION_5, TUIC_COMMAND_PACKET];
+        assert!(decode_tuic_udp_packet(&truncated, 0).is_err());
+    }
+
+    fn udp_header(addr: OwnedProxyAddress, port: u16) -> OwnedProxyHeader {
+        OwnedProxyHeader {
+            network: Network::Udp,
+            address: addr,
+            port,
+        }
+    }
+
+    #[test]
+    fn tuic_udp_single_fragment_fast_path() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+        );
+        let payload = b"small dns query";
+        let fragments = encode_tuic_udp_fragments(&header, payload, 7, 9, 1500).unwrap();
+        assert_eq!(fragments.len(), 1);
+        let mut reassembler = TuicUdpReassembler::default();
+        let fragment = decode_tuic_udp_fragment(&fragments[0]).unwrap();
+        let (data, target) = reassembler.accept(fragment).unwrap().unwrap();
+        assert_eq!(data, payload);
+        assert_eq!(target, SocketAddr::from(([1, 1, 1, 1], 53)));
+    }
+
+    #[test]
+    fn tuic_udp_fragments_split_and_reassemble_in_order() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            443,
+        );
+        let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        let fragments = encode_tuic_udp_fragments(&header, &payload, 0x1111, 0x2222, 128).unwrap();
+        assert!(fragments.len() > 1, "payload should split");
+
+        let first = decode_tuic_udp_fragment(&fragments[0]).unwrap();
+        assert_eq!(first.fragment_id, 0);
+        assert!(first.target.is_some(), "frag 0 carries the address");
+        for frag in &fragments[1..] {
+            let decoded = decode_tuic_udp_fragment(frag).unwrap();
+            assert!(decoded.target.is_none(), "later frags use the none address");
+        }
+
+        let mut reassembler = TuicUdpReassembler::default();
+        let mut result = None;
+        for frag in &fragments {
+            let decoded = decode_tuic_udp_fragment(frag).unwrap();
+            if let Some(done) = reassembler.accept(decoded).unwrap() {
+                result = Some(done);
+            }
+        }
+        let (data, target) = result.expect("reassembly completes");
+        assert_eq!(data, payload);
+        assert_eq!(target, SocketAddr::from(([9, 9, 9, 9], 443)));
+    }
+
+    #[test]
+    fn tuic_udp_fragments_reassemble_out_of_order() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(8, 8, 4, 4)),
+            53,
+        );
+        let payload: Vec<u8> = (0..2500u32).map(|i| (i * 7) as u8).collect();
+        let fragments = encode_tuic_udp_fragments(&header, &payload, 5, 6, 200).unwrap();
+        assert!(fragments.len() >= 3);
+
+        let mut reassembler = TuicUdpReassembler::default();
+        let mut order: Vec<usize> = (0..fragments.len()).collect();
+        order.reverse();
+        let mut result = None;
+        for idx in order {
+            let decoded = decode_tuic_udp_fragment(&fragments[idx]).unwrap();
+            if let Some(done) = reassembler.accept(decoded).unwrap() {
+                result = Some(done);
+            }
+        }
+        let (data, _) = result.expect("out-of-order reassembly completes");
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn tuic_udp_reassembler_rejects_duplicate_fragment() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            80,
+        );
+        let payload: Vec<u8> = vec![0xAB; 1000];
+        let fragments = encode_tuic_udp_fragments(&header, &payload, 1, 1, 100).unwrap();
+        let mut reassembler = TuicUdpReassembler::default();
+        let first = decode_tuic_udp_fragment(&fragments[0]).unwrap();
+        assert!(reassembler.accept(first).unwrap().is_none());
+        let dup = decode_tuic_udp_fragment(&fragments[0]).unwrap();
+        assert!(
+            reassembler.accept(dup).is_err(),
+            "duplicate must be rejected"
+        );
+    }
+
+    #[test]
+    fn tuic_udp_fragment_decode_enforces_address_discipline() {
+        let mut frag0 = encode_tuic_udp_fragment(
+            &udp_header(
+                OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(5, 5, 5, 5)),
+                1,
+            ),
+            b"x",
+            1,
+            1,
+            2,
+            0,
+            false,
+        )
+        .unwrap();
+        frag0[6] = 2;
+        frag0[7] = 0;
+        assert!(
+            decode_tuic_udp_fragment(&frag0).is_err(),
+            "frag 0 without real address must fail"
+        );
+
+        let frag1 = encode_tuic_udp_fragment(
+            &udp_header(
+                OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(5, 5, 5, 5)),
+                1,
+            ),
+            b"x",
+            1,
+            1,
+            2,
+            1,
+            true,
+        )
+        .unwrap();
+        assert!(
+            decode_tuic_udp_fragment(&frag1).is_err(),
+            "non-first frag with real address must fail"
+        );
+    }
+
+    #[test]
+    fn tuic_udp_fragment_decode_rejects_bad_index() {
+        let frag = encode_tuic_udp_fragment(
+            &udp_header(
+                OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(7, 7, 7, 7)),
+                9,
+            ),
+            b"y",
+            1,
+            1,
+            2,
+            0,
+            true,
+        );
+        let mut bytes = frag.unwrap();
+        bytes[6] = 2;
+        bytes[7] = 2;
+        assert!(decode_tuic_udp_fragment(&bytes).is_err());
+    }
+
+    #[test]
+    fn tuic_dissociate_frame_parses() {
+        let bytes = [TUIC_VERSION_5, TUIC_COMMAND_DISSOCIATE, 0x12, 0x34];
+        assert_eq!(bytes[0], TUIC_VERSION_5);
+        assert_eq!(bytes[1], TUIC_COMMAND_DISSOCIATE);
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 0x1234);
     }
 }
