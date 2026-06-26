@@ -1,0 +1,7 @@
+[env]
+# aws-lc-sys bundles a jitterentropy C library whose CMake build emits
+# `-Wp,-U_FORTIFY_SOURCE`, which `zig cc` rejects during cargo-zigbuild
+# cross/old-glibc builds. Disabling it avoids that failure and also removes
+# tens-to-hundreds of milliseconds of process-startup latency. It is inert for
+# normal native `cargo build`.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
