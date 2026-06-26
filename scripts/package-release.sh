@@ -115,12 +115,23 @@ case "$output_dir" in
 esac
 build_tool="${CARGO_BUILD_TOOL:-cargo}"
 build_flags=()
-build_command=("$build_tool" build)
+# zigbuild produces portable Linux binaries linked against an old glibc floor
+# (default 2.17) via cargo-zigbuild. The cargo subcommand is `cargo zigbuild`,
+# the required tool is `cargo`, and the target triple carries a `.<glibc>` suffix
+# only while building; output paths use the bare triple.
+zigbuild_glibc="${ZIGBUILD_GLIBC:-2.17}"
+if [ "$build_tool" = "zigbuild" ]; then
+  build_command=(cargo zigbuild)
+  require_tool cargo
+  require_tool cargo-zigbuild
+else
+  build_command=("$build_tool" build)
+  require_tool "$build_tool"
+fi
 if [ -n "${CARGO_BUILD_FLAGS:-}" ]; then
   read -r -a build_flags <<< "$CARGO_BUILD_FLAGS"
   build_command+=("${build_flags[@]}")
 fi
-require_tool "$build_tool"
 require_tool rustc
 require_tool jq
 require_tool zip
@@ -143,7 +154,11 @@ fi
 validate_friendly_name "$friendly_name"
 
 if [ "$skip_build" -eq 0 ]; then
-  if [ "$build_tool" = "cargo" ] && [ "$target" = "$(host_triple)" ]; then
+  if [ "$build_tool" = "zigbuild" ]; then
+    AWS_LC_SYS_NO_JITTER_ENTROPY=1 ZUICITY_VERSION="$version" VERSION="$version" \
+      "${build_command[@]}" --release -p zuicity-cli --bins \
+      --target "$target.$zigbuild_glibc"
+  elif [ "$build_tool" = "cargo" ] && [ "$target" = "$(host_triple)" ]; then
     ZUICITY_VERSION="$version" VERSION="$version" "${build_command[@]}" --release -p zuicity-cli --bins
   else
     ZUICITY_VERSION="$version" VERSION="$version" "${build_command[@]}" --release -p zuicity-cli --bins --target "$target"
@@ -151,7 +166,7 @@ if [ "$skip_build" -eq 0 ]; then
 fi
 
 bin_dir="target/release"
-if [ "$target" != "$(host_triple)" ]; then
+if [ "$target" != "$(host_triple)" ] || [ "$build_tool" = "zigbuild" ]; then
   bin_dir="target/$target/release"
 fi
 client_bin="$bin_dir/zuicity-client"

@@ -73,14 +73,14 @@ jobs:
               "linux-mips64le",
           }
           matrix = [
-              {"target": "x86_64-unknown-linux-gnu", "friendly_name": "linux-x86_64", "runner": "ubuntu-latest", "build_tool": "cargo", "use_cross": False, "skip_smoke": False, "rustflags": ""},
+              {"target": "x86_64-unknown-linux-gnu", "friendly_name": "linux-x86_64", "runner": "ubuntu-latest", "build_tool": "zigbuild", "use_cross": False, "skip_smoke": False, "rustflags": ""},
               {"target": "x86_64-unknown-linux-gnu", "friendly_name": "linux-x86_64_v2_sse", "runner": "ubuntu-latest", "build_tool": "cargo", "use_cross": False, "skip_smoke": True, "rustflags": "-C target-cpu=x86-64-v2"},
               {"target": "x86_64-unknown-linux-gnu", "friendly_name": "linux-x86_64_v3_avx2", "runner": "ubuntu-latest", "build_tool": "cargo", "use_cross": False, "skip_smoke": True, "rustflags": "-C target-cpu=x86-64-v3"},
               {"target": "i686-unknown-linux-gnu", "friendly_name": "linux-x86_32", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
-              {"target": "aarch64-unknown-linux-gnu", "friendly_name": "linux-arm64", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
+              {"target": "aarch64-unknown-linux-gnu", "friendly_name": "linux-arm64", "runner": "ubuntu-latest", "build_tool": "zigbuild", "use_cross": False, "skip_smoke": True, "rustflags": ""},
               {"target": "arm-unknown-linux-gnueabi", "friendly_name": "linux-armv5", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
               {"target": "arm-unknown-linux-gnueabihf", "friendly_name": "linux-armv6", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": "-C target-cpu=arm1176jzf-s -C target-feature=-neon"},
-              {"target": "armv7-unknown-linux-gnueabihf", "friendly_name": "linux-armv7", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
+              {"target": "armv7-unknown-linux-gnueabihf", "friendly_name": "linux-armv7", "runner": "ubuntu-latest", "build_tool": "zigbuild", "use_cross": False, "skip_smoke": True, "rustflags": ""},
               {"target": "mips-unknown-linux-gnu", "friendly_name": "linux-mips32", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
               {"target": "mipsel-unknown-linux-gnu", "friendly_name": "linux-mips32le", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
               {"target": "mips64-unknown-linux-gnuabi64", "friendly_name": "linux-mips64", "runner": "ubuntu-latest", "build_tool": "cross", "use_cross": True, "skip_smoke": True, "rustflags": ""},
@@ -208,6 +208,18 @@ jobs:
       - name: Install cross
         if: matrix.use_cross
         uses: taiki-e/install-action@cross
+
+      - name: Install Zig
+        if: matrix.build_tool == 'zigbuild'
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Build package
         env:
