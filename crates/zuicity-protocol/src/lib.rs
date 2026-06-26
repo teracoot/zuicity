@@ -738,4 +738,74 @@ mod tests {
         let encoded = generate_cert_chain_hash_base64_from_pem(pem).unwrap();
         assert_eq!(encoded, "51IrbkfPN5VRLzlM9q6tPEHhyEckeXrDAzxdmDaQW_0=");
     }
+
+    #[test]
+    fn proxy_header_roundtrips_empty_domain() {
+        let header = ProxyHeader::new(Network::Tcp, ProxyAddress::Domain(b""), 80);
+        let mut encoded = bytes::BytesMut::new();
+        header.encode_to(&mut encoded).unwrap();
+        assert_eq!(encoded.as_ref(), b"\x01\x03\x00\x00\x50");
+        let (decoded, rest) = ProxyHeader::decode(&encoded).unwrap();
+        assert_eq!(decoded, header);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn proxy_header_roundtrips_max_length_domain() {
+        let domain = [b'a'; 255];
+        let header = ProxyHeader::new(Network::Tcp, ProxyAddress::Domain(&domain), 443);
+        let mut encoded = bytes::BytesMut::new();
+        header.encode_to(&mut encoded).unwrap();
+        assert_eq!(encoded[1], RUNTIME_ADDR_TYPE_DOMAIN);
+        assert_eq!(encoded[2], 255);
+        let (decoded, rest) = ProxyHeader::decode(&encoded).unwrap();
+        assert_eq!(decoded, header);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn proxy_header_roundtrips_port_zero_and_max() {
+        for port in [0_u16, u16::MAX] {
+            let header = ProxyHeader::new(
+                Network::Udp,
+                ProxyAddress::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+                port,
+            );
+            let mut encoded = bytes::BytesMut::new();
+            header.encode_to(&mut encoded).unwrap();
+            let (decoded, _) = ProxyHeader::decode(&encoded).unwrap();
+            assert_eq!(decoded.port, port);
+        }
+    }
+
+    #[test]
+    fn proxy_header_decode_rejects_unknown_address_type() {
+        assert!(matches!(
+            ProxyHeader::decode(&[0x01, 0x7f, 0x00, 0x00]),
+            Err(ProtocolError::UnknownRuntimeAddrType(0x7f))
+        ));
+    }
+
+    #[test]
+    fn proxy_header_decode_rejects_domain_length_overrun() {
+        let truncated = [0x01, RUNTIME_ADDR_TYPE_DOMAIN, 0x10, b'a', b'b'];
+        assert!(matches!(
+            ProxyHeader::decode(&truncated),
+            Err(ProtocolError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn proxy_header_roundtrips_ipv6() {
+        let header = ProxyHeader::new(
+            Network::Tcp,
+            ProxyAddress::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            8443,
+        );
+        let mut encoded = bytes::BytesMut::new();
+        header.encode_to(&mut encoded).unwrap();
+        let (decoded, rest) = ProxyHeader::decode(&encoded).unwrap();
+        assert_eq!(decoded, header);
+        assert!(rest.is_empty());
+    }
 }
