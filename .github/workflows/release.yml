@@ -30,6 +30,12 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+      publish_release:
+        description: Publish a GitHub release; when false only build and upload artifacts
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -289,7 +295,7 @@ jobs:
             source-package/zuicity-full-src.zip.sha256
 
   upload-release:
-    if: ${{ inputs.platform == 'all' }}
+    if: ${{ inputs.platform == 'all' && inputs.publish_release == 'true' }}
     needs:
       - package
       - source-package
