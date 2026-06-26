@@ -2829,7 +2829,14 @@ impl AuthenticatedConnection {
         let (send, mut recv) = self.connection.accept_bi().await?;
         let (header, initial_payload) = read_proxy_header_prefix(&mut recv).await?;
         let target_stream = connect_tcp_proxy_target_with_egress(&header, egress).await?;
-        relay_tcp_proxy_stream(send, recv, target_stream, initial_payload).await
+        relay_tcp_proxy_stream(
+            send,
+            recv,
+            target_stream,
+            initial_payload,
+            DEFAULT_NAT_TIMEOUT,
+        )
+        .await
     }
 
     /// Accepts one bidirectional proxy stream, classifies its network header, and relays it.
@@ -3146,7 +3153,14 @@ impl AcceptedProxyStream {
             Network::Tcp => {
                 let target_stream = connect_tcp_proxy_target_with_egress(&header, egress).await?;
                 Ok(ProxyRelayReport::Tcp(
-                    relay_tcp_proxy_stream(send, recv, target_stream, initial_payload).await?,
+                    relay_tcp_proxy_stream(
+                        send,
+                        recv,
+                        target_stream,
+                        initial_payload,
+                        idle_timeout,
+                    )
+                    .await?,
                 ))
             }
             Network::Udp => Ok(ProxyRelayReport::Udp(
@@ -8204,7 +8218,18 @@ async fn read_runtime_target_metadata(
     Ok(())
 }
 
-async fn relay_copy<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+// Bounds each read/write so a relay wedged on a stuck half (target whose receive
+// window stays closed, or a vanished peer that never sends or FINs) cannot block
+// forever. The timer wraps one operation at a time, so it measures *stall*, not
+// total duration: any completed read or write resets it, leaving healthy long
+// transfers untouched. A stall past `stall_timeout` surfaces as TimedOut, ending
+// the copy so the connection teardown can proceed (without this bound a single
+// stuck relay pinned its connection's task and buffers until OOM under load).
+async fn relay_copy_with_stall_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    stall_timeout: Duration,
+) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
@@ -8212,11 +8237,17 @@ where
     let mut buffer = vec![0_u8; RELAY_COPY_BUFFER_SIZE];
     let mut copied = 0_u64;
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = match tokio::time::timeout(stall_timeout, reader.read(&mut buffer)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        };
         if read == 0 {
             break;
         }
-        writer.write_all(&buffer[..read]).await?;
+        match tokio::time::timeout(stall_timeout, writer.write_all(&buffer[..read])).await {
+            Ok(result) => result?,
+            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        }
         copied += read as u64;
     }
     writer.flush().await?;
@@ -8228,6 +8259,7 @@ async fn relay_tcp_proxy_stream(
     quic_recv: quinn::RecvStream,
     target_stream: TcpProxyTargetStream,
     initial_payload: Vec<u8>,
+    stall_timeout: Duration,
 ) -> Result<TcpProxyRelayReport, TransportError> {
     let target = target_stream.peer_addr();
     let (mut target_read, mut target_write) = tokio::io::split(target_stream);
@@ -8240,13 +8272,17 @@ async fn relay_tcp_proxy_stream(
             target_write.write_all(&initial_payload).await?;
             bytes += initial_payload.len() as u64;
         }
-        bytes += relay_copy(&mut client_to_target, &mut target_write).await?;
+        bytes +=
+            relay_copy_with_stall_timeout(&mut client_to_target, &mut target_write, stall_timeout)
+                .await?;
         target_write.shutdown().await?;
         Ok::<_, TransportError>(bytes)
     });
 
     let target_to_client_task = tokio::spawn(async move {
-        let bytes = relay_copy(&mut target_read, &mut target_to_quic).await?;
+        let bytes =
+            relay_copy_with_stall_timeout(&mut target_read, &mut target_to_quic, stall_timeout)
+                .await?;
         target_to_quic.finish()?;
         // Await peer acknowledgement of the FIN before this task returns and the
         // connection is dropped, so a graceful close never races the client
@@ -10825,7 +10861,7 @@ mod tests {
             })?;
             let target_stream =
                 TcpProxyTargetStream::plain(tokio::net::TcpStream::connect(request.target).await?)?;
-            relay_tcp_proxy_stream(send, recv, target_stream, Vec::new()).await
+            relay_tcp_proxy_stream(send, recv, target_stream, Vec::new(), DEFAULT_NAT_TIMEOUT).await
         });
         Ok((local_addr, request_rx, task))
     }
@@ -14144,5 +14180,74 @@ mod tests {
         assert_eq!(bytes[0], TUIC_VERSION_5);
         assert_eq!(bytes[1], TUIC_COMMAND_DISSOCIATE);
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 0x1234);
+    }
+
+    #[tokio::test]
+    async fn relay_copy_with_stall_timeout_copies_all_bytes_when_data_flows() {
+        let (mut writer_end, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let payload = vec![0x5a_u8; 200 * 1024];
+        let expected = payload.clone();
+        let feeder = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut writer_end, &payload)
+                .await
+                .expect("feed payload");
+            drop(writer_end);
+        });
+
+        let copied = relay_copy_with_stall_timeout(&mut reader, &mut sink, Duration::from_secs(30))
+            .await
+            .expect("steady-flow copy must not time out");
+
+        feeder.await.expect("feeder task");
+        assert_eq!(copied, expected.len() as u64);
+        assert_eq!(sink, expected);
+    }
+
+    #[tokio::test]
+    async fn relay_copy_with_stall_timeout_fires_on_stalled_reader() {
+        // Reader half never produces data and never closes: a wedged peer. The
+        // stall timer must elapse and surface TimedOut instead of hanging.
+        let (_held_writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let started = tokio::time::Instant::now();
+        let error =
+            relay_copy_with_stall_timeout(&mut reader, &mut sink, Duration::from_millis(150))
+                .await
+                .expect_err("stalled reader must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stall timeout must fire promptly, not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_copy_with_stall_timeout_resets_on_progress() {
+        // Several writes spaced just under the stall window: each resets the
+        // timer, so a long but steadily-progressing transfer never times out.
+        let (mut writer_end, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let feeder = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                tokio::io::AsyncWriteExt::write_all(&mut writer_end, &[0x11_u8; 1024])
+                    .await
+                    .expect("write chunk");
+            }
+            drop(writer_end);
+        });
+
+        let copied =
+            relay_copy_with_stall_timeout(&mut reader, &mut sink, Duration::from_millis(200))
+                .await
+                .expect("steady progress must not trip the stall timer");
+
+        feeder.await.expect("feeder task");
+        assert_eq!(copied, 5 * 1024);
     }
 }

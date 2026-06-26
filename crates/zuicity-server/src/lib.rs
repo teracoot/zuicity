@@ -17,6 +17,13 @@ use zuicity_transport::{
 
 const PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 
+// On normal connection close the QUIC connection is already gone, so healthy
+// relays error out on their QUIC half within milliseconds; only relays wedged on
+// the egress (target) side linger. This deadline lets those healthy relays finish
+// their final bytes, then force-aborts the wedged ones so the connection task can
+// never hang on a stuck relay (the leak that grew unbounded under load).
+const PROXY_CONNECTION_CLOSE_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Server runtime options independent from CLI parsing.
 #[derive(Clone, Debug)]
 pub struct ServerRuntimeConfig {
@@ -864,12 +871,22 @@ async fn run_authenticated_proxy_connection_until(
     };
 
     if shutdown_requested {
-        drain_proxy_relays(&mut relays, &mut report, &hooks).await?;
+        drain_proxy_relays(
+            &mut relays,
+            &mut report,
+            &hooks,
+            PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT,
+        )
+        .await?;
         connection.as_quinn().close(0u32.into(), b"server shutdown");
     } else {
-        while let Some(relay) = relays.join_next().await {
-            record_proxy_connection_result(&mut report, &hooks, relay?);
-        }
+        drain_proxy_relays(
+            &mut relays,
+            &mut report,
+            &hooks,
+            PROXY_CONNECTION_CLOSE_RELAY_DRAIN_TIMEOUT,
+        )
+        .await?;
     }
     if let Some(handle) = tuic_udp_relay {
         handle.abort();
@@ -881,9 +898,10 @@ async fn drain_proxy_relays(
     relays: &mut tokio::task::JoinSet<Result<ProxyRelayReport, zuicity_transport::TransportError>>,
     report: &mut ServerProxyLoopReport,
     hooks: &ServerRuntimeHooks,
+    drain_timeout: Duration,
 ) -> Result<(), ServerError> {
     loop {
-        match tokio::time::timeout(PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT, relays.join_next()).await {
+        match tokio::time::timeout(drain_timeout, relays.join_next()).await {
             Ok(Some(relay)) => record_proxy_connection_result(report, hooks, relay?),
             Ok(None) => return Ok(()),
             Err(_) => break,
@@ -5068,5 +5086,52 @@ mod tests {
             Some(zuicity_transport::ProxyDialerLink::ShadowsocksR(_))
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_proxy_relays_aborts_hung_relay_within_deadline() {
+        // Regression: the normal connection-close path used to await every relay
+        // unconditionally, so one relay wedged on a stuck egress pinned the
+        // connection task (and its resources) forever - the leak that grew until
+        // OOM under load. drain_proxy_relays must record finished relays, then
+        // abort the hung one and return promptly instead of hanging.
+        let mut relays: tokio::task::JoinSet<
+            Result<ProxyRelayReport, zuicity_transport::TransportError>,
+        > = tokio::task::JoinSet::new();
+
+        relays.spawn(async {
+            Ok(ProxyRelayReport::Tcp(
+                zuicity_transport::TcpProxyRelayReport {
+                    target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+                    bytes_from_client: 10,
+                    bytes_from_target: 20,
+                },
+            ))
+        });
+        relays.spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("hung relay must be aborted, never completes");
+        });
+
+        let mut report = ServerProxyLoopReport::default();
+        let hooks = ServerRuntimeHooks::default();
+
+        let started = Instant::now();
+        drain_proxy_relays(&mut relays, &mut report, &hooks, Duration::from_millis(200))
+            .await
+            .expect("drain must succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain must abort the hung relay promptly, took {elapsed:?}"
+        );
+        assert!(relays.is_empty(), "all relays must be reaped after drain");
+        assert_eq!(
+            report.completed_tcp_relays, 1,
+            "the finished relay must be recorded before the hung one is aborted"
+        );
+        assert_eq!(report.bytes_from_client, 10);
+        assert_eq!(report.bytes_from_target, 20);
     }
 }
