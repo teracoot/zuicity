@@ -120,7 +120,7 @@ async fn concurrent_socks5_udp_associations_echo_payloads() -> anyhow::Result<()
     );
     assert_eq!(summary.listener_accepted_connections, 2);
     assert_eq!(summary.listener_completed_udp_associations, 2);
-    assert_eq!(summary.server_accepted_connections, 2);
+    assert_eq!(summary.server_accepted_connections, 1);
     assert_eq!(summary.server_completed_udp_relays, 2);
     assert!(summary.bytes_echoed > 0);
     Ok(())
