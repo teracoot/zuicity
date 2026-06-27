@@ -8218,13 +8218,10 @@ async fn read_runtime_target_metadata(
     Ok(())
 }
 
-// Bounds each read/write so a relay wedged on a stuck half (target whose receive
-// window stays closed, or a vanished peer that never sends or FINs) cannot block
-// forever. The timer wraps one operation at a time, so it measures *stall*, not
-// total duration: any completed read or write resets it, leaving healthy long
-// transfers untouched. A stall past `stall_timeout` surfaces as TimedOut, ending
-// the copy so the connection teardown can proceed (without this bound a single
-// stuck relay pinned its connection's task and buffers until OOM under load).
+// Bounds writes so a relay wedged on a target whose receive window stays closed
+// cannot block forever. Reads are allowed to idle: long-lived TCP sessions such
+// as SSH can legitimately have no payload for minutes while the QUIC connection
+// itself remains healthy via keepalive.
 async fn relay_copy_with_stall_timeout<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -8237,10 +8234,7 @@ where
     let mut buffer = vec![0_u8; RELAY_COPY_BUFFER_SIZE];
     let mut copied = 0_u64;
     loop {
-        let read = match tokio::time::timeout(stall_timeout, reader.read(&mut buffer)).await {
-            Ok(result) => result?,
-            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
-        };
+        let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
@@ -8266,7 +8260,7 @@ async fn relay_tcp_proxy_stream(
     let mut target_to_quic = quic_send;
     let mut client_to_target = quic_recv;
 
-    let client_to_target_task = tokio::spawn(async move {
+    let client_to_target = async {
         let mut bytes = 0_u64;
         if !initial_payload.is_empty() {
             target_write.write_all(&initial_payload).await?;
@@ -8277,9 +8271,9 @@ async fn relay_tcp_proxy_stream(
                 .await?;
         target_write.shutdown().await?;
         Ok::<_, TransportError>(bytes)
-    });
+    };
 
-    let target_to_client_task = tokio::spawn(async move {
+    let target_to_client = async {
         let bytes =
             relay_copy_with_stall_timeout(&mut target_read, &mut target_to_quic, stall_timeout)
                 .await?;
@@ -8289,10 +8283,10 @@ async fn relay_tcp_proxy_stream(
         // draining the final bytes into a spurious `closed by peer` error.
         target_to_quic.stopped().await?;
         Ok::<_, TransportError>(bytes)
-    });
+    };
 
-    let bytes_from_client = client_to_target_task.await??;
-    let bytes_from_target = target_to_client_task.await??;
+    let (bytes_from_client, bytes_from_target) =
+        tokio::try_join!(client_to_target, target_to_client)?;
     Ok(TcpProxyRelayReport {
         target,
         bytes_from_client,
@@ -11352,6 +11346,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn rust_rust_tcp_proxy_stream_keeps_idle_target_response_open()
+    -> Result<(), TransportError> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let target_addr = listener.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let (mut target_stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 4];
+            target_stream.read_exact(&mut request).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            target_stream.write_all(b"idle response").await?;
+            Ok::<_, std::io::Error>(request)
+        });
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"tcp idle response password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated
+                .accept_proxy_once_with_idle_timeout(Duration::from_millis(100))
+                .await
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let mut stream = authenticated
+            .open_tcp_proxy_stream(target_addr.ip(), target_addr.port())
+            .await?;
+
+        stream.write_all(b"ping").await?;
+        stream.finish()?;
+        let response = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(1024))
+            .await
+            .expect("idle TCP proxy response timed out")?;
+        assert_eq!(response, b"idle response");
+
+        let request = target_task.await??;
+        assert_eq!(&request, b"ping");
+        let relayed = server_task.await??;
+        assert_eq!(relayed.bytes_from_client(), b"ping".len() as u64);
+        assert_eq!(relayed.bytes_from_target(), b"idle response".len() as u64);
+        Ok(())
+    }
+
     #[test]
     fn socks_dialer_link_requires_explicit_port_like_upstream() {
         for raw in ["socks://127.0.0.1", "socks5://127.0.0.1"] {
@@ -14205,24 +14260,65 @@ mod tests {
         assert_eq!(sink, expected);
     }
 
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
-    async fn relay_copy_with_stall_timeout_fires_on_stalled_reader() {
-        // Reader half never produces data and never closes: a wedged peer. The
-        // stall timer must elapse and surface TimedOut instead of hanging.
-        let (_held_writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let mut sink: Vec<u8> = Vec::new();
+    async fn relay_copy_with_stall_timeout_fires_on_stalled_writer() {
+        let mut reader = b"payload".as_slice();
+        let mut writer = StalledWriter;
 
         let started = tokio::time::Instant::now();
         let error =
-            relay_copy_with_stall_timeout(&mut reader, &mut sink, Duration::from_millis(150))
+            relay_copy_with_stall_timeout(&mut reader, &mut writer, Duration::from_millis(150))
                 .await
-                .expect_err("stalled reader must time out");
+                .expect_err("stalled writer must time out");
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "stall timeout must fire promptly, not hang"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_copy_with_stall_timeout_keeps_idle_reader_alive() {
+        let (mut writer_end, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut sink: Vec<u8> = Vec::new();
+
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut writer_end, b"after idle")
+                .await
+                .expect("write after idle");
+            drop(writer_end);
+        });
+
+        let copied =
+            relay_copy_with_stall_timeout(&mut reader, &mut sink, Duration::from_millis(100))
+                .await
+                .expect("idle read must not trip the TCP relay stall guard");
+
+        feeder.await.expect("feeder task");
+        assert_eq!(copied, b"after idle".len() as u64);
+        assert_eq!(sink, b"after idle");
     }
 
     #[tokio::test]
