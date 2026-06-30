@@ -6003,7 +6003,9 @@ struct TuicUdpAssociation {
 }
 
 struct TuicUdpPacket {
+    #[cfg(test)]
     association_id: u16,
+    #[cfg(test)]
     packet_id: u16,
     target: SocketAddr,
     payload: Vec<u8>,
@@ -6684,11 +6686,21 @@ async fn relay_udp_payload_to_target_via_tuic(
         .ok_or(TransportError::NoUsableUdpTarget)?;
     let packet_id = association.next_packet_id;
     association.next_packet_id = association.next_packet_id.wrapping_add(1);
-    let datagram = encode_tuic_udp_packet(header, payload, association.association_id, packet_id)?;
-    association
-        .connection
-        .send_datagram(bytes::Bytes::from(datagram))
-        .map_err(tuic_send_datagram_error)?;
+    let datagrams = encode_outbound_tuic_udp_datagrams(
+        TuicOutboundUdpPacket {
+            header,
+            payload,
+            association_id: association.association_id,
+            packet_id,
+        },
+        association.connection.max_datagram_size(),
+    )?;
+    for datagram in datagrams {
+        association
+            .connection
+            .send_datagram(bytes::Bytes::from(datagram))
+            .map_err(tuic_send_datagram_error)?;
+    }
     let response = tokio::time::timeout(
         Duration::from_secs(1),
         association.connection.read_datagram(),
@@ -6787,6 +6799,7 @@ async fn send_tuic_dissociate(
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_tuic_udp_packet(
     header: &OwnedProxyHeader,
     payload: &[u8],
@@ -6902,6 +6915,31 @@ fn encode_tuic_udp_fragments(
     Ok(fragments)
 }
 
+struct TuicOutboundUdpPacket<'a> {
+    header: &'a OwnedProxyHeader,
+    payload: &'a [u8],
+    association_id: u16,
+    packet_id: u16,
+}
+
+fn encode_outbound_tuic_udp_datagrams(
+    packet: TuicOutboundUdpPacket<'_>,
+    max_datagram_size: Option<usize>,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    let Some(max_datagram_size) = max_datagram_size else {
+        return Err(tuic_send_datagram_error(
+            quinn::SendDatagramError::UnsupportedByPeer,
+        ));
+    };
+    encode_tuic_udp_fragments(
+        packet.header,
+        packet.payload,
+        packet.association_id,
+        packet.packet_id,
+        max_datagram_size,
+    )
+}
+
 fn tuic_target_encoded_len(header: &OwnedProxyHeader) -> Result<usize, TransportError> {
     Ok(match &header.address {
         OwnedProxyAddress::Ipv4(_) => 1 + 4 + 2,
@@ -6933,6 +6971,7 @@ fn decode_tuic_udp_packet(
     if association_id != expected_association_id {
         return Err(tuic_packet_error("packet association id mismatch"));
     }
+    #[cfg(test)]
     let packet_id = u16::from_be_bytes([datagram[4], datagram[5]]);
     if datagram[6] != 1 || datagram[7] != 0 {
         return Err(tuic_packet_error(
@@ -6948,7 +6987,9 @@ fn decode_tuic_udp_packet(
         return Err(tuic_packet_error("packet payload length mismatch"));
     }
     Ok(TuicUdpPacket {
+        #[cfg(test)]
         association_id,
+        #[cfg(test)]
         packet_id,
         target,
         payload: datagram[payload_offset..end].to_vec(),
@@ -13555,6 +13596,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rust_rust_udp_over_stream_repeated_near_mtu_payloads() -> Result<(), TransportError> {
+        let echo = zuicity_testkit::UdpEchoServer::start()
+            .await
+            .expect("start UDP echo fixture");
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"udp over stream near mtu password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let echo_addr = echo.local_addr();
+
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated.accept_udp_over_stream_once().await
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let mut stream = authenticated
+            .open_udp_over_stream(echo_addr.ip(), echo_addr.port())
+            .await?;
+        let payload_sizes = [1190_usize, 1200, 1210, 1232, 1472];
+        let mut total_payload_bytes = 0_u64;
+
+        for cycle in 0..4_usize {
+            for size in payload_sizes {
+                let payload: Vec<u8> = (0..size)
+                    .map(|offset| {
+                        u8::try_from((cycle + offset) % 251).expect("fixture byte fits u8")
+                    })
+                    .collect();
+                tokio::time::timeout(Duration::from_secs(2), stream.send_datagram(&payload))
+                    .await
+                    .expect("UDP-over-stream send timed out")?;
+                let echoed =
+                    tokio::time::timeout(Duration::from_secs(2), stream.recv_datagram(4096))
+                        .await
+                        .expect("UDP-over-stream receive timed out")?;
+                assert_eq!(echoed.payload, payload);
+                assert_eq!(echoed.target, echo_addr);
+                total_payload_bytes += u64::try_from(size).expect("fixture size fits u64");
+            }
+        }
+        stream.finish()?;
+
+        let relayed = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("UDP-over-stream relay task timed out")??;
+        assert_eq!(relayed.target, echo_addr);
+        assert_eq!(relayed.bytes_from_client, total_payload_bytes);
+        assert_eq!(relayed.bytes_from_target, total_payload_bytes);
+        echo.shutdown().await.expect("shutdown UDP echo fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pinned_cert_chain_allows_self_signed_match_without_root_trust()
     -> Result<(), TransportError> {
         let cert = rcgen::generate_simple_self_signed(vec!["pin.local".to_owned()])
@@ -14052,8 +14164,8 @@ mod tests {
         let encoded = encode_tuic_udp_packet(&header, payload, association_id, packet_id).unwrap();
         let decoded = decode_tuic_udp_packet(&encoded, association_id).unwrap();
 
-        assert_eq!(decoded.association_id, association_id);
-        assert_eq!(decoded.packet_id, packet_id);
+        assert_eq!(u16::from_be_bytes([encoded[2], encoded[3]]), association_id);
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), packet_id);
         assert_eq!(decoded.target, SocketAddr::from(([8, 8, 8, 8], 53)));
         assert_eq!(decoded.payload, payload);
     }
@@ -14124,6 +14236,124 @@ mod tests {
         let (data, target) = result.expect("reassembly completes");
         assert_eq!(data, payload);
         assert_eq!(target, SocketAddr::from(([9, 9, 9, 9], 443)));
+    }
+
+    #[test]
+    fn tuic_udp_outbound_datagrams_respect_peer_max_size() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            443,
+        );
+        let payload: Vec<u8> = (0..3000_u32)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+            .collect();
+        let max_datagram_size = 128;
+
+        let datagrams = encode_outbound_tuic_udp_datagrams(
+            TuicOutboundUdpPacket {
+                header: &header,
+                payload: &payload,
+                association_id: 0x1111,
+                packet_id: 0x2222,
+            },
+            Some(max_datagram_size),
+        )
+        .unwrap();
+
+        assert!(datagrams.len() > 1, "payload should split");
+        assert!(
+            datagrams
+                .iter()
+                .all(|datagram| datagram.len() <= max_datagram_size),
+            "each outbound TUIC UDP datagram must fit the peer limit"
+        );
+        let mut reassembler = TuicUdpReassembler::default();
+        let mut result = None;
+        for datagram in &datagrams {
+            let decoded = decode_tuic_udp_fragment(datagram).unwrap();
+            if let Some(done) = reassembler.accept(decoded).unwrap() {
+                result = Some(done);
+            }
+        }
+        let (data, target) = result.expect("reassembly completes");
+        assert_eq!(data, payload);
+        assert_eq!(target, SocketAddr::from(([9, 9, 9, 9], 443)));
+    }
+
+    #[test]
+    fn tuic_udp_outbound_datagrams_fit_dae_quic_go_limit() {
+        const DAE_QUIC_GO_MAX_DATAGRAM_FRAME_SIZE: usize = 1200;
+        const QUINN_DATAGRAM_SIZE_BOUND: usize = 9;
+        let max_datagram_size = DAE_QUIC_GO_MAX_DATAGRAM_FRAME_SIZE - QUINN_DATAGRAM_SIZE_BOUND;
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            443,
+        );
+
+        for payload_size in [1400_usize, 1472, 16_000] {
+            let payload: Vec<u8> = (0..payload_size)
+                .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+                .collect();
+            let datagrams = encode_outbound_tuic_udp_datagrams(
+                TuicOutboundUdpPacket {
+                    header: &header,
+                    payload: &payload,
+                    association_id: 0x1111,
+                    packet_id: 0x2222,
+                },
+                Some(max_datagram_size),
+            )
+            .unwrap();
+
+            assert!(
+                datagrams.len() > 1,
+                "observed payload {payload_size} should fragment for dae's 1200-byte DATAGRAM frame limit"
+            );
+            assert!(
+                datagrams
+                    .iter()
+                    .all(|datagram| datagram.len() <= max_datagram_size),
+                "every encoded TUIC UDP datagram must fit dae's quic-go send_datagram payload limit"
+            );
+            let mut reassembler = TuicUdpReassembler::default();
+            let mut result = None;
+            for datagram in &datagrams {
+                let decoded = decode_tuic_udp_fragment(datagram).unwrap();
+                if let Some(done) = reassembler.accept(decoded).unwrap() {
+                    result = Some(done);
+                }
+            }
+            let (data, target) = result.expect("reassembly completes");
+            assert_eq!(data, payload);
+            assert_eq!(target, SocketAddr::from(([9, 9, 9, 9], 443)));
+        }
+    }
+
+    #[test]
+    fn tuic_udp_outbound_datagrams_error_when_peer_disables_datagrams() {
+        let header = udp_header(
+            OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+            443,
+        );
+
+        let error = encode_outbound_tuic_udp_datagrams(
+            TuicOutboundUdpPacket {
+                header: &header,
+                payload: b"dns payload",
+                association_id: 0x1111,
+                packet_id: 0x2222,
+            },
+            None,
+        )
+        .expect_err("disabled peer datagrams should return TUIC datagram error");
+
+        match error {
+            TransportError::TuicProxy { stage, message } => {
+                assert_eq!(stage, "datagram");
+                assert_eq!(message, "datagrams not supported by peer");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
