@@ -2982,7 +2982,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zuicity-benchmarks"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "rcgen",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-config"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "hex",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-dae"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "bytes",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-testkit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-transport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "aes-gcm",
