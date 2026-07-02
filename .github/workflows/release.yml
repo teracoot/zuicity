@@ -56,6 +56,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           SOURCE_REF: ${{ inputs.source_ref }}
           PLATFORM: ${{ inputs.platform }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -66,6 +67,7 @@ jobs:
           tag = os.environ["RELEASE_TAG"]
           source_ref = os.environ["SOURCE_REF"]
           platform = os.environ["PLATFORM"]
+          publish_release = os.environ["PUBLISH_RELEASE"]
           tag_pattern = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$")
           ref_pattern = re.compile(r"^(refs/[A-Za-z0-9._/-]+|[A-Za-z0-9._/-]+)$")
           platforms = {
@@ -105,11 +107,14 @@ jobs:
           if platform not in platforms:
               print(f"invalid platform: {platform}", file=sys.stderr)
               sys.exit(2)
+          if publish_release not in {"false", "true"}:
+              print(f"invalid publish_release: {publish_release}", file=sys.stderr)
+              sys.exit(2)
           if source_ref and not ref_pattern.match(source_ref):
               print(f"invalid source ref: {source_ref}", file=sys.stderr)
               sys.exit(2)
-          if platform == "all" and source_ref:
-              print("source_ref is only allowed for targeted proof builds", file=sys.stderr)
+          if platform == "all" and source_ref and publish_release == "true":
+              print("source_ref all-package builds cannot publish release assets; set publish_release=false or clear source_ref", file=sys.stderr)
               sys.exit(2)
 
           selected = matrix if platform == "all" else [row for row in matrix if row["friendly_name"] == platform]
@@ -295,7 +300,7 @@ jobs:
             source-package/zuicity-full-src.zip.sha256
 
   upload-release:
-    if: ${{ inputs.platform == 'all' && inputs.publish_release == 'true' }}
+    if: ${{ inputs.platform == 'all' && inputs.publish_release == 'true' && inputs.source_ref == '' }}
     needs:
       - package
       - source-package
