@@ -11,7 +11,7 @@ use zuicity_config::ServerConfig;
 use zuicity_protocol::AtomicCounter64;
 use zuicity_transport::{
     DEFAULT_NAT_TIMEOUT, JuicityQuicServer, ProxyEgressPolicy, ProxyProtocol, ProxyRelayReport,
-    StreamPolicy, TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
+    QuicRuntimePolicy, StreamPolicy, TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
     run_tuic_udp_datagram_relay,
 };
 
@@ -33,6 +33,8 @@ pub struct ServerRuntimeConfig {
     pub tls: TlsPolicy,
     /// QUIC stream policy.
     pub streams: StreamPolicy,
+    /// QUIC runtime policy.
+    pub quic: QuicRuntimePolicy,
 }
 
 impl ServerRuntimeConfig {
@@ -43,6 +45,7 @@ impl ServerRuntimeConfig {
             config,
             tls: TlsPolicy::upstream(),
             streams: StreamPolicy::upstream(),
+            quic: QuicRuntimePolicy::upstream_server(),
         }
     }
 
@@ -127,7 +130,9 @@ impl ServerRuntime {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<BoundServerRuntime, ServerError> {
-        let server = JuicityQuicServer::bind_with_pem(addr, cert_pem, key_pem)?;
+        let mut quic = self.config.quic.clone();
+        quic.streams = self.config.streams.clone();
+        let server = JuicityQuicServer::bind_with_pem_and_policy(addr, cert_pem, key_pem, &quic)?;
         let local_addr = server.local_addr()?;
         tracing::info!(listen = %local_addr, "Listen at {local_addr}");
         let users = self
@@ -814,6 +819,8 @@ async fn run_authenticated_proxy_connection_until(
     let _connection_guard = connection_guard;
     let mut report = ServerProxyLoopReport::default();
     let mut relays = tokio::task::JoinSet::new();
+    let connection_closed = connection.as_quinn().closed();
+    tokio::pin!(connection_closed);
 
     let tuic_udp_relay = if connection.protocol() == ProxyProtocol::Tuic {
         let quic = connection.as_quinn().clone();
@@ -841,6 +848,7 @@ async fn run_authenticated_proxy_connection_until(
                     break true;
                 }
             }
+            _ = &mut connection_closed => break false,
             accepted = connection.accept_proxy_stream() => {
                 match accepted {
                     Ok(stream) => {
@@ -855,6 +863,7 @@ async fn run_authenticated_proxy_connection_until(
                         });
                     }
                     Err(error) if proxy_connection_closed(&error) => break false,
+                    Err(error) if proxy_stream_closed_before_header(&error) => {}
                     Err(error) => {
                         tracing::warn!(error = %error, "handleStream");
                         hooks.proxy_stream_failed();
@@ -928,6 +937,12 @@ fn record_proxy_connection_result(
             report.add_relay(relay);
         }
         Err(error) if proxy_connection_closed(&error) => {}
+        Err(error) if proxy_stream_closed_before_header(&error) => {}
+        Err(error) if proxy_target_open_failed(&error) => {
+            tracing::debug!(error = %error, "targetStream");
+            hooks.proxy_stream_failed();
+            report.failed_proxy_streams += 1;
+        }
         Err(error) => {
             tracing::warn!(error = %error, "handleStream");
             hooks.proxy_stream_failed();
@@ -981,7 +996,37 @@ fn proxy_connection_closed(error: &zuicity_transport::TransportError) -> bool {
         error,
         TransportError::Connection(_)
             | TransportError::Stopped(zuicity_transport::StoppedError::ConnectionLost(_))
-    )
+    ) || matches!(error, TransportError::Io(source) if io_error_is_peer_close(source))
+}
+
+fn proxy_stream_closed_before_header(error: &zuicity_transport::TransportError) -> bool {
+    zuicity_transport::proxy_stream_closed_before_header(error)
+}
+
+fn proxy_target_open_failed(error: &zuicity_transport::TransportError) -> bool {
+    use zuicity_transport::TransportError;
+    matches!(
+        error,
+        TransportError::NoUsableTcpTarget | TransportError::NoUsableUdpTarget
+    ) || matches!(error, TransportError::Io(source) if io_error_is_target_open_failure(source))
+}
+
+fn io_error_is_peer_close(error: &std::io::Error) -> bool {
+    error.to_string() == "connection lost"
+}
+
+fn io_error_is_target_open_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+    ) || error
+        .to_string()
+        .contains("failed to lookup address information")
 }
 
 /// Server runtime errors.
@@ -4178,6 +4223,8 @@ mod tests {
         assert_eq!(echoed_udp.target, udp_addr);
         assert_eq!(echoed_udp.payload, b"classified udp");
         udp_stream.finish()?;
+        drop(udp_stream);
+        drop(connection);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown_tx.send(()).expect("send shutdown");
@@ -4266,6 +4313,8 @@ mod tests {
         assert_eq!(echoed_udp.target, udp_addr);
         assert_eq!(echoed_udp.payload, b"same connection udp");
         udp_stream.finish()?;
+        drop(udp_stream);
+        drop(connection);
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown_tx.send(()).expect("send shutdown");
@@ -4794,6 +4843,174 @@ mod tests {
         assert_eq!(report.failed_proxy_streams, 1);
         echo.shutdown().await.expect("shutdown TCP echo fixture");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_runtime_proxy_loop_ignores_empty_proxy_stream_before_header()
+    -> Result<(), ServerError> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "empty proxy stream password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
+            .expect("generate fixture cert");
+        let echo = zuicity_testkit::TcpEchoServer::start()
+            .await
+            .expect("start TCP echo fixture");
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","users":{{"{uuid}":"{password}"}}}}"#
+        ))?);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            bound
+                .run_proxy_loop_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "server.local",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            )
+            .await?;
+        let (mut empty_send, empty_recv) = connection
+            .as_quinn()
+            .open_bi()
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        empty_send
+            .finish()
+            .map_err(zuicity_transport::TransportError::from)?;
+        drop(empty_recv);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let target = echo.local_addr();
+        let mut stream = connection
+            .open_tcp_proxy_stream(target.ip(), target.port())
+            .await?;
+        stream.write_all(b"after empty stream").await?;
+        stream.finish()?;
+        let echoed = stream.read_to_end(1024).await?;
+        assert_eq!(echoed, b"after empty stream");
+
+        drop(connection);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown_tx.send(()).expect("send shutdown");
+        let report = server_task.await??;
+        assert_eq!(report.accepted_connections, 1);
+        assert_eq!(report.completed_tcp_relays, 1);
+        assert_eq!(report.failed_proxy_streams, 0);
+        echo.shutdown().await.expect("shutdown TCP echo fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_runtime_proxy_loop_counts_partial_proxy_header_and_accepts_next_stream()
+    -> Result<(), ServerError> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "partial proxy stream password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
+            .expect("generate fixture cert");
+        let echo = zuicity_testkit::TcpEchoServer::start()
+            .await
+            .expect("start TCP echo fixture");
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","users":{{"{uuid}":"{password}"}}}}"#
+        ))?);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            bound
+                .run_proxy_loop_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "server.local",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            )
+            .await?;
+        let (mut partial_send, partial_recv) = connection
+            .as_quinn()
+            .open_bi()
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        partial_send
+            .write_all(&[zuicity_protocol::Network::Tcp.as_u8()])
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        partial_send
+            .finish()
+            .map_err(zuicity_transport::TransportError::from)?;
+        drop(partial_recv);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let target = echo.local_addr();
+        let mut stream = connection
+            .open_tcp_proxy_stream(target.ip(), target.port())
+            .await?;
+        stream.write_all(b"after partial stream").await?;
+        stream.finish()?;
+        let echoed = stream.read_to_end(1024).await?;
+        assert_eq!(echoed, b"after partial stream");
+
+        drop(connection);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown_tx.send(()).expect("send shutdown");
+        let report = server_task.await??;
+        assert_eq!(report.accepted_connections, 1);
+        assert_eq!(report.completed_tcp_relays, 1);
+        assert_eq!(report.failed_proxy_streams, 1);
+        echo.shutdown().await.expect("shutdown TCP echo fixture");
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_connection_closed_classifies_io_connection_lost() {
+        let error = zuicity_transport::TransportError::Io(std::io::Error::other("connection lost"));
+        assert!(proxy_connection_closed(&error));
+    }
+
+    #[test]
+    fn proxy_target_open_failed_classifies_dns_and_route_failures() {
+        let dns_error = zuicity_transport::TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "failed to lookup address information: Name or service not known",
+        ));
+        let route_error = zuicity_transport::TransportError::Io(std::io::Error::from(
+            std::io::ErrorKind::NetworkUnreachable,
+        ));
+        let timeout_error = zuicity_transport::TransportError::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        ));
+
+        assert!(proxy_target_open_failed(&dns_error));
+        assert!(proxy_target_open_failed(&route_error));
+        assert!(!proxy_target_open_failed(&timeout_error));
     }
 
     #[test]

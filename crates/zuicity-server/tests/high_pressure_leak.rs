@@ -51,7 +51,9 @@ async fn high_pressure_wedged_relays_do_not_leak_connections() {
         .expect("parse server config"),
     )
     .expect("validate server config");
-    let runtime = ServerRuntime::new(ServerRuntimeConfig::from_config(server_config));
+    let mut runtime_config = ServerRuntimeConfig::from_config(server_config);
+    runtime_config.quic.max_idle_timeout_millis = Some(2_000);
+    let runtime = ServerRuntime::new(runtime_config);
     let bound = runtime
         .bind_with_pem(
             ([127, 0, 0, 1], 0).into(),
@@ -109,7 +111,6 @@ async fn high_pressure_wedged_relays_do_not_leak_connections() {
                         tokio::time::timeout(Duration::from_secs(2), stream.write_all(&blob)).await;
                 }
             }
-            // Client vanishes: drop the QUIC connection while relays are wedged.
             drop(connection);
         }));
     }

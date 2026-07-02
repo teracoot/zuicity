@@ -62,6 +62,9 @@ pub const SERVER_KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// Upstream default UDP NAT association timeout.
 pub const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
+/// Quinn's default maximum QUIC idle timeout, in milliseconds.
+pub const DEFAULT_QUIC_MAX_IDLE_TIMEOUT_MILLIS: u32 = 30_000;
+
 /// Per-direction relay copy buffer. Larger than tokio::io::copy's 8 KiB default
 /// so bulk transfers hand the QUIC stack and the kernel socket large write
 /// batches, cutting syscall and stream-frame overhead on high-throughput flows.
@@ -1527,6 +1530,8 @@ pub struct QuicRuntimePolicy {
     pub streams: StreamPolicy,
     /// Keepalive period.
     pub keep_alive: Duration,
+    /// Maximum negotiated QUIC idle timeout in milliseconds.
+    pub max_idle_timeout_millis: Option<u32>,
     /// Optional client handshake idle timeout.
     pub handshake_idle_timeout: Option<Duration>,
     /// Whether path MTU discovery is disabled.
@@ -1547,6 +1552,7 @@ impl QuicRuntimePolicy {
             receive_windows: ReceiveWindowPolicy::upstream(),
             streams: StreamPolicy::upstream(),
             keep_alive: CLIENT_KEEP_ALIVE,
+            max_idle_timeout_millis: Some(DEFAULT_QUIC_MAX_IDLE_TIMEOUT_MILLIS),
             handshake_idle_timeout: Some(CLIENT_HANDSHAKE_IDLE_TIMEOUT),
             disable_path_mtu_discovery: false,
             enable_datagrams: false,
@@ -1562,6 +1568,7 @@ impl QuicRuntimePolicy {
             receive_windows: ReceiveWindowPolicy::upstream(),
             streams: StreamPolicy::upstream(),
             keep_alive: SERVER_KEEP_ALIVE,
+            max_idle_timeout_millis: Some(DEFAULT_QUIC_MAX_IDLE_TIMEOUT_MILLIS),
             handshake_idle_timeout: None,
             disable_path_mtu_discovery: false,
             enable_datagrams: true,
@@ -1615,6 +1622,12 @@ impl BuiltTransportConfig {
         Some(self.policy.keep_alive)
     }
 
+    /// Returns the configured QUIC maximum idle timeout in milliseconds.
+    #[must_use]
+    pub const fn max_idle_timeout_millis(&self) -> Option<u32> {
+        self.policy.max_idle_timeout_millis
+    }
+
     /// Returns the datagram receive-buffer setting derived from the policy.
     #[must_use]
     pub const fn datagram_receive_buffer_size(&self) -> Option<usize> {
@@ -1641,7 +1654,8 @@ pub enum GsoMode {
     Off,
     /// Attempt GSO on eligible short-header batched transmits, with per-message
     /// `UDP_SEGMENT` cmsg and same-call fallback to plain datagrams on the first
-    /// `EINVAL`/`EIO` from a destination. Default in production.
+    /// `EINVAL`/`EIO` from a destination. Enabled only when the environment
+    /// opts in on Linux.
     Auto,
 }
 
@@ -1650,25 +1664,25 @@ impl GsoMode {
     /// (`UDP_MAX_SEGMENTS = 1 << 6`).
     const MAX_GSO_SEGMENTS: usize = 64;
 
-    /// Resolves the production GSO mode from the environment, mirroring Go
-    /// quic-go's `QUIC_GO_DISABLE_GSO`. `ZUICITY_DISABLE_GSO=1` (or `true`)
-    /// forces [`GsoMode::Off`]; anything else (including unset) is
-    /// [`GsoMode::Auto`]. On non-Linux targets GSO is always [`GsoMode::Off`].
+    /// Resolves the production GSO mode from the environment. GSO is opt-in:
+    /// `ZUICITY_ENABLE_GSO=1` (or `true`) enables [`GsoMode::Auto`], while
+    /// unset or `ZUICITY_DISABLE_GSO=1` keeps [`GsoMode::Off`]. On non-Linux
+    /// targets GSO is always [`GsoMode::Off`].
     #[must_use]
     pub fn from_env() -> Self {
-        if !cfg!(target_os = "linux") {
+        let enable = std::env::var("ZUICITY_ENABLE_GSO").ok();
+        let disable = std::env::var("ZUICITY_DISABLE_GSO").ok();
+        Self::from_env_values(enable.as_deref(), disable.as_deref())
+    }
+
+    fn from_env_values(enable: Option<&str>, disable: Option<&str>) -> Self {
+        if !cfg!(target_os = "linux") || env_flag_is_set(disable) {
             return Self::Off;
         }
-        match std::env::var("ZUICITY_DISABLE_GSO") {
-            Ok(value) => {
-                let value = value.trim();
-                if value == "1" || value.eq_ignore_ascii_case("true") {
-                    Self::Off
-                } else {
-                    Self::Auto
-                }
-            }
-            Err(_) => Self::Auto,
+        if env_flag_is_set(enable) {
+            Self::Auto
+        } else {
+            Self::Off
         }
     }
 
@@ -1679,6 +1693,13 @@ impl GsoMode {
             Self::Auto => Self::MAX_GSO_SEGMENTS,
         }
     }
+}
+
+fn env_flag_is_set(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 /// Selects whether the adaptive UDP socket enables Linux UDP GRO
@@ -2453,6 +2474,11 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
         policy.receive_windows.initial_connection as u32,
     ));
     inner.keep_alive_interval(Some(policy.keep_alive));
+    inner.max_idle_timeout(
+        policy
+            .max_idle_timeout_millis
+            .map(|millis| quinn::IdleTimeout::from(quinn::VarInt::from_u32(millis))),
+    );
     inner.datagram_receive_buffer_size(if policy.enable_datagrams {
         Some(usize::from(u16::MAX))
     } else {
@@ -2467,9 +2493,9 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
     // then attempts a single per-message `UDP_SEGMENT` sendmsg with same-call
     // fallback, and never segments long-header (Initial/Handshake) packets, so
     // GSO-hostile paths (quinn-rs/quinn#2575, #2202) cannot strand the
-    // handshake. In [`GsoMode::Off`] (or non-Linux, or `ZUICITY_DISABLE_GSO=1`)
-    // segmentation is disabled and every transmit is one datagram, matching
-    // upstream Go quic-go behaviour.
+    // handshake. Unless `ZUICITY_ENABLE_GSO=1` opts in on Linux, segmentation is
+    // disabled and every transmit is one datagram, matching upstream Go quic-go
+    // behaviour.
     inner.enable_segmentation_offload(matches!(GsoMode::from_env(), GsoMode::Auto));
     apply_congestion_controller(&mut inner, policy);
     BuiltTransportConfig {
@@ -2521,13 +2547,28 @@ pub fn build_server_config_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<QuicServerConfig, TransportError> {
+    build_server_config_from_pem_with_policy(
+        cert_pem,
+        key_pem,
+        &QuicRuntimePolicy::upstream_server(),
+    )
+}
+
+/// Builds a Quinn server config from PEM material and an explicit QUIC policy.
+pub fn build_server_config_from_pem_with_policy(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    policy: &QuicRuntimePolicy,
+) -> Result<QuicServerConfig, TransportError> {
     let crypto = build_server_crypto_config_from_pem(cert_pem, key_pem)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?,
     ));
-    config
-        .transport_config(build_transport_config(&QuicRuntimePolicy::upstream_server()).into_arc());
-    Ok(QuicServerConfig { inner: config })
+    config.transport_config(build_transport_config(policy).into_arc());
+    Ok(QuicServerConfig {
+        inner: config,
+        policy: policy.clone(),
+    })
 }
 
 /// Builds upstream-compatible rustls client crypto from optional root PEMs.
@@ -2563,13 +2604,16 @@ pub fn build_client_config_with_roots(
     roots_pem: &[u8],
     allow_insecure: bool,
 ) -> Result<QuicClientConfig, TransportError> {
+    let policy = QuicRuntimePolicy::upstream_client();
     let crypto = build_client_crypto_config_with_roots(roots_pem, allow_insecure)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config
-        .transport_config(build_transport_config(&QuicRuntimePolicy::upstream_client()).into_arc());
-    Ok(QuicClientConfig { inner: config })
+    config.transport_config(build_transport_config(&policy).into_arc());
+    Ok(QuicClientConfig {
+        inner: config,
+        policy,
+    })
 }
 
 fn build_client_crypto_config_with_webpki_roots(
@@ -2596,13 +2640,16 @@ fn build_client_crypto_config_with_webpki_roots(
 fn build_client_config_with_webpki_roots(
     allow_insecure: bool,
 ) -> Result<QuicClientConfig, TransportError> {
+    let policy = QuicRuntimePolicy::upstream_client();
     let crypto = build_client_crypto_config_with_webpki_roots(allow_insecure)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config
-        .transport_config(build_transport_config(&QuicRuntimePolicy::upstream_client()).into_arc());
-    Ok(QuicClientConfig { inner: config })
+    config.transport_config(build_transport_config(&policy).into_arc());
+    Ok(QuicClientConfig {
+        inner: config,
+        policy,
+    })
 }
 
 /// Builds upstream-compatible rustls client crypto using only a pinned certificate-chain hash.
@@ -2627,13 +2674,16 @@ pub fn build_client_crypto_config_with_cert_chain_pin(
 pub fn build_client_config_with_cert_chain_pin(
     pinned_cert_chain_sha256: &[u8],
 ) -> Result<QuicClientConfig, TransportError> {
+    let policy = QuicRuntimePolicy::upstream_client();
     let crypto = build_client_crypto_config_with_cert_chain_pin(pinned_cert_chain_sha256)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config
-        .transport_config(build_transport_config(&QuicRuntimePolicy::upstream_client()).into_arc());
-    Ok(QuicClientConfig { inner: config })
+    config.transport_config(build_transport_config(&policy).into_arc());
+    Ok(QuicClientConfig {
+        inner: config,
+        policy,
+    })
 }
 
 /// Minimal Juicity QUIC server endpoint for authenticated runtime tests.
@@ -2649,7 +2699,22 @@ impl JuicityQuicServer {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Result<Self, TransportError> {
-        let config = build_server_config_from_pem(cert_pem, key_pem)?;
+        Self::bind_with_pem_and_policy(
+            addr,
+            cert_pem,
+            key_pem,
+            &QuicRuntimePolicy::upstream_server(),
+        )
+    }
+
+    /// Binds a server endpoint with explicit QUIC runtime policy.
+    pub fn bind_with_pem_and_policy(
+        addr: SocketAddr,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        policy: &QuicRuntimePolicy,
+    ) -> Result<Self, TransportError> {
+        let config = build_server_config_from_pem_with_policy(cert_pem, key_pem, policy)?;
         let endpoint = build_ecn_safe_endpoint(addr, Some(config.inner))?;
         Ok(Self { endpoint })
     }
@@ -2979,6 +3044,12 @@ fn udp_session_connection_lost(error: &TransportError) -> bool {
                 quinn::ReadError::ConnectionLost(_),
             ))
     )
+}
+
+/// Returns true when a peer opened a proxy stream and closed it before the header.
+#[must_use]
+pub fn proxy_stream_closed_before_header(error: &TransportError) -> bool {
+    matches!(error, TransportError::ProxyStreamClosedBeforeHeader)
 }
 
 /// Client-side TCP proxy stream over an authenticated Juicity QUIC connection.
@@ -5758,6 +5829,45 @@ async fn relay_udp_payload_to_target_with_socket(
     Err(TransportError::NoUsableUdpTarget)
 }
 
+async fn send_udp_payload_to_target_with_socket(
+    relay_socket: &mut Option<(bool, tokio::net::UdpSocket)>,
+    header: &OwnedProxyHeader,
+    payload: &[u8],
+    egress: &ProxyEgressPolicy,
+) -> Result<SocketAddr, TransportError> {
+    let targets = udp_header_targets(header).await?;
+    let mut last_error = None;
+    for target in targets {
+        if egress_source_mismatches_target(egress, target) {
+            continue;
+        }
+        let target_is_ipv4 = target.is_ipv4();
+        let needs_socket = match relay_socket {
+            Some((socket_is_ipv4, _)) => *socket_is_ipv4 != target_is_ipv4,
+            None => true,
+        };
+        if needs_socket {
+            let bind_addr = udp_relay_bind_addr(target_is_ipv4, egress);
+            let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+            apply_socket_fwmark(&socket, egress)?;
+            *relay_socket = Some((target_is_ipv4, socket));
+        }
+
+        let socket = &relay_socket
+            .as_ref()
+            .ok_or(TransportError::NoUsableUdpTarget)?
+            .1;
+        match socket.send_to(payload, target).await {
+            Ok(_) => return Ok(target),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error.into()),
+        None => Err(TransportError::NoUsableUdpTarget),
+    }
+}
+
 enum UdpEgressRelayState {
     Direct(Option<(bool, tokio::net::UdpSocket)>),
     Socks5(Option<Socks5UdpAssociation>),
@@ -8071,6 +8181,17 @@ async fn relay_udp_over_stream_session(
         ));
     }
 
+    if egress.dialer_link.is_none() {
+        return relay_direct_udp_over_stream_session(
+            send,
+            recv,
+            stream_header,
+            idle_timeout,
+            egress,
+        )
+        .await;
+    }
+
     let mut relay_state = UdpEgressRelayState::default();
     let mut first_target = None;
     let mut bytes_from_client = 0_u64;
@@ -8099,11 +8220,7 @@ async fn relay_udp_over_stream_session(
         bytes_from_client += request.payload.len() as u64;
         bytes_from_target += response.len() as u64;
 
-        let response_header = proxy_header_for_ip(Network::Udp, peer.ip(), peer.port());
-        let mut encoded =
-            Vec::with_capacity(response_header.address.runtime_metadata_len() + 2 + response.len());
-        encode_udp_datagram(&response_header, &response, &mut encoded)?;
-        send.write_all(&encoded).await?;
+        write_udp_over_stream_response(&mut send, peer, &response).await?;
     }
     let target = first_target.ok_or(TransportError::EmptyUdpOverStream)?;
     if !peer_closed_connection {
@@ -8114,6 +8231,149 @@ async fn relay_udp_over_stream_session(
         bytes_from_client,
         bytes_from_target,
     })
+}
+
+async fn relay_direct_udp_over_stream_session(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    _stream_header: OwnedProxyHeader,
+    idle_timeout: Duration,
+    egress: ProxyEgressPolicy,
+) -> Result<UdpOverStreamRelayReport, TransportError> {
+    enum ClientToTargetExit {
+        Finished,
+        ConnectionLost,
+        Idle,
+    }
+
+    let mut relay_socket = None;
+    let frame = tokio::time::timeout(idle_timeout, read_udp_datagram_frame(&mut recv)).await;
+    let first_request = match frame {
+        Ok(Ok(request)) => request,
+        Ok(Err(TransportError::ReadExact(quinn::ReadExactError::FinishedEarly(0)))) | Err(_) => {
+            return Err(TransportError::EmptyUdpOverStream);
+        }
+        Ok(Err(error)) => return Err(error),
+    };
+    let target = send_udp_payload_to_target_with_socket(
+        &mut relay_socket,
+        &first_request.header,
+        &first_request.payload,
+        &egress,
+    )
+    .await?;
+    let (_, socket) = relay_socket
+        .take()
+        .ok_or(TransportError::NoUsableUdpTarget)?;
+
+    let mut bytes_from_client = first_request.payload.len() as u64;
+    let mut bytes_from_target = 0_u64;
+    let mut response = vec![0_u8; 65_535];
+
+    let client_to_target = async {
+        let mut bytes_from_client = 0_u64;
+        let exit = loop {
+            let frame =
+                tokio::time::timeout(idle_timeout, read_udp_datagram_frame(&mut recv)).await;
+            let request = match frame {
+                Ok(Ok(request)) => request,
+                Ok(Err(TransportError::ReadExact(quinn::ReadExactError::FinishedEarly(0)))) => {
+                    break ClientToTargetExit::Finished;
+                }
+                Ok(Err(error)) if udp_session_connection_lost(&error) => {
+                    break ClientToTargetExit::ConnectionLost;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break ClientToTargetExit::Idle,
+            };
+            // Direct UDP-over-stream is one target per session; keep later
+            // frame headers from retargeting the socket selected by the first
+            // datagram.
+            socket.send_to(&request.payload, target).await?;
+            bytes_from_client += request.payload.len() as u64;
+        };
+        Ok::<_, TransportError>((bytes_from_client, exit))
+    };
+    tokio::pin!(client_to_target);
+
+    let (drain_target_replies, mut peer_closed_connection) = loop {
+        tokio::select! {
+            result = &mut client_to_target => {
+                let (client_bytes, exit) = result?;
+                bytes_from_client += client_bytes;
+                break match exit {
+                    ClientToTargetExit::Finished => (true, false),
+                    ClientToTargetExit::ConnectionLost => (false, true),
+                    ClientToTargetExit::Idle => (false, false),
+                };
+            }
+            received = socket.recv_from(&mut response) => {
+                let (received, peer) = received?;
+                bytes_from_target += received as u64;
+                write_udp_over_stream_response(&mut send, peer, &response[..received]).await?;
+            }
+        }
+    };
+
+    let response_send_stopped = send.stopped();
+    tokio::pin!(response_send_stopped);
+    while drain_target_replies && !peer_closed_connection {
+        tokio::select! {
+            stopped = &mut response_send_stopped => {
+                match stopped {
+                    Ok(_) | Err(quinn::StoppedError::ConnectionLost(_)) => {
+                        peer_closed_connection = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            received = tokio::time::timeout(idle_timeout, socket.recv_from(&mut response)) => {
+                let (received, peer) = match received {
+                    Ok(Ok(received)) => received,
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(_) => break,
+                };
+                match write_udp_over_stream_response(&mut send, peer, &response[..received]).await {
+                    Ok(()) => {
+                        bytes_from_target += received as u64;
+                    }
+                    Err(
+                        TransportError::Write(
+                            quinn::WriteError::ConnectionLost(_)
+                            | quinn::WriteError::Stopped(_)
+                            | quinn::WriteError::ClosedStream,
+                        )
+                        | TransportError::ClosedStream(_),
+                    ) => {
+                        peer_closed_connection = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    if !peer_closed_connection {
+        send.finish()?;
+    }
+    Ok(UdpOverStreamRelayReport {
+        target,
+        bytes_from_client,
+        bytes_from_target,
+    })
+}
+
+async fn write_udp_over_stream_response(
+    send: &mut quinn::SendStream,
+    peer: SocketAddr,
+    response: &[u8],
+) -> Result<(), TransportError> {
+    let response_header = proxy_header_for_ip(Network::Udp, peer.ip(), peer.port());
+    let mut encoded =
+        Vec::with_capacity(response_header.address.runtime_metadata_len() + 2 + response.len());
+    encode_udp_datagram(&response_header, response, &mut encoded)?;
+    send.write_all(&encoded).await?;
+    Ok(())
 }
 
 async fn read_udp_datagram_frame(recv: &mut quinn::RecvStream) -> Result<UdpFrame, TransportError> {
@@ -8152,7 +8412,13 @@ async fn read_proxy_header_prefix(
     recv: &mut quinn::RecvStream,
 ) -> Result<(OwnedProxyHeader, Vec<u8>), TransportError> {
     let mut network = [0_u8; 1];
-    recv.read_exact(&mut network).await?;
+    match recv.read_exact(&mut network).await {
+        Ok(()) => {}
+        Err(quinn::ReadExactError::FinishedEarly(0)) => {
+            return Err(TransportError::ProxyStreamClosedBeforeHeader);
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     let mut encoded = Vec::with_capacity(1 + 1 + 16 + 2);
     encoded.extend_from_slice(&network);
@@ -8437,13 +8703,14 @@ fn export_connection_authentication_token(
 pub struct QuicServerConfig {
     /// Built Quinn server configuration.
     pub inner: quinn::ServerConfig,
+    policy: QuicRuntimePolicy,
 }
 
 impl QuicServerConfig {
     /// Returns the applied upstream transport policy wrapper.
     #[must_use]
     pub fn transport(&self) -> BuiltTransportConfig {
-        build_transport_config(&QuicRuntimePolicy::upstream_server())
+        build_transport_config(&self.policy)
     }
 }
 
@@ -8452,13 +8719,14 @@ impl QuicServerConfig {
 pub struct QuicClientConfig {
     /// Built Quinn client configuration.
     pub inner: quinn::ClientConfig,
+    policy: QuicRuntimePolicy,
 }
 
 impl QuicClientConfig {
     /// Returns the applied upstream transport policy wrapper.
     #[must_use]
     pub fn transport(&self) -> BuiltTransportConfig {
-        build_transport_config(&QuicRuntimePolicy::upstream_client())
+        build_transport_config(&self.policy)
     }
 }
 
@@ -8738,6 +9006,9 @@ pub enum TransportError {
     /// Authentication failed.
     #[error("authentication rejected")]
     AuthenticationRejected,
+    /// Peer closed a proxy stream before sending the first header byte.
+    #[error("proxy stream closed before header")]
+    ProxyStreamClosedBeforeHeader,
     /// A non-TCP proxy stream arrived where TCP was required.
     #[error("unexpected proxy network {0:?}")]
     UnexpectedProxyNetwork(zuicity_protocol::Network),
@@ -8886,6 +9157,38 @@ mod tests {
         assert!(policy.enable_datagrams);
         assert_eq!(policy.congestion_controller, CongestionController::Bbr);
         assert_eq!(policy.cwnd, 10);
+    }
+
+    #[test]
+    fn gso_mode_is_safe_by_default_and_opt_in_on_linux() {
+        assert_eq!(GsoMode::from_env_values(None, None), GsoMode::Off);
+        assert_eq!(GsoMode::from_env_values(Some("false"), None), GsoMode::Off);
+        assert_eq!(
+            GsoMode::from_env_values(Some("1"), None),
+            if cfg!(target_os = "linux") {
+                GsoMode::Auto
+            } else {
+                GsoMode::Off
+            }
+        );
+        assert_eq!(
+            GsoMode::from_env_values(Some("true"), Some("1")),
+            GsoMode::Off
+        );
+    }
+
+    #[test]
+    fn proxy_stream_closed_before_header_classifies_zero_byte_eof() {
+        let error = TransportError::ProxyStreamClosedBeforeHeader;
+
+        assert!(proxy_stream_closed_before_header(&error));
+    }
+
+    #[test]
+    fn proxy_stream_closed_before_header_ignores_later_read_eof() {
+        let error = TransportError::ReadExact(quinn::ReadExactError::FinishedEarly(0));
+
+        assert!(!proxy_stream_closed_before_header(&error));
     }
 
     #[test]
@@ -13513,7 +13816,9 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let authenticated = server.accept_authenticated(uuid, password).await?;
-            authenticated.accept_udp_over_stream_once().await
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
         });
 
         let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
@@ -13544,6 +13849,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_over_stream_forwards_burst_without_target_response() -> Result<(), TransportError>
+    {
+        let sink = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let sink_addr = sink.local_addr()?;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"udp burst password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
+        });
+        let sink_task = tokio::spawn(async move {
+            let mut payloads = Vec::with_capacity(2);
+            let mut buffer = [0_u8; 1024];
+            for _ in 0..2 {
+                let received =
+                    tokio::time::timeout(Duration::from_millis(250), sink.recv_from(&mut buffer))
+                        .await
+                        .map_err(|_| TransportError::NoUsableUdpTarget)??;
+                payloads.push(buffer[..received.0].to_vec());
+            }
+            Ok::<_, TransportError>(payloads)
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let mut stream = authenticated
+            .open_udp_over_stream(sink_addr.ip(), sink_addr.port())
+            .await?;
+        stream.send_datagram(b"burst one").await?;
+        stream.send_datagram(b"burst two").await?;
+        stream.finish()?;
+
+        let payloads = sink_task.await??;
+        assert_eq!(payloads, vec![b"burst one".to_vec(), b"burst two".to_vec()]);
+        let relayed = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .map_err(|_| TransportError::NoUsableUdpTarget)???;
+        assert_eq!(relayed.target, sink_addr);
+        assert_eq!(
+            relayed.bytes_from_client,
+            b"burst one".len() as u64 + b"burst two".len() as u64
+        );
+        assert_eq!(relayed.bytes_from_target, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_udp_over_stream_preserves_partial_client_frame_when_target_replies()
+    -> Result<(), TransportError> {
+        let target = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let target_addr = target.local_addr()?;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"udp split frame password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
+        });
+        let target_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 1024];
+            let (received, relay_addr) = target.recv_from(&mut buffer).await?;
+            assert_eq!(&buffer[..received], b"first");
+
+            let (received, second_relay_addr) = target.recv_from(&mut buffer).await?;
+            assert_eq!(second_relay_addr, relay_addr);
+            assert_eq!(&buffer[..received], b"second");
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            target.send_to(b"second response", relay_addr).await?;
+
+            let (received, third_relay_addr) =
+                tokio::time::timeout(Duration::from_secs(1), target.recv_from(&mut buffer))
+                    .await
+                    .expect("third payload should reach UDP target")?;
+            assert_eq!(third_relay_addr, relay_addr);
+            assert_eq!(&buffer[..received], b"third");
+            target.send_to(b"third response", relay_addr).await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let (mut send, mut recv) = authenticated
+            .as_quinn()
+            .open_bi()
+            .await
+            .map_err(TransportError::from)?;
+        let header = OwnedProxyHeader::from_ip(Network::Udp, target_addr.ip(), target_addr.port());
+        let encode_frame = |payload: &[u8]| -> Result<Vec<u8>, TransportError> {
+            let header = header.as_borrowed();
+            let mut encoded =
+                Vec::with_capacity(header.address.runtime_metadata_len() + 2 + payload.len());
+            encode_udp_datagram(&header, payload, &mut encoded)?;
+            Ok(encoded)
+        };
+
+        write_proxy_header(&mut send, &header).await?;
+        send.write_all(&encode_frame(b"first")?).await?;
+        send.write_all(&encode_frame(b"second")?).await?;
+        let third_frame = encode_frame(b"third")?;
+        let third_split = third_frame.len() - 1;
+        send.write_all(&third_frame[..third_split]).await?;
+
+        let second_response =
+            tokio::time::timeout(Duration::from_secs(2), read_udp_datagram_frame(&mut recv))
+                .await
+                .expect("second response should arrive while third frame is incomplete")?;
+        assert_eq!(udp_ip_header_target(&second_response.header)?, target_addr);
+        assert_eq!(second_response.payload, b"second response");
+
+        send.write_all(&third_frame[third_split..]).await?;
+        let third_response =
+            tokio::time::timeout(Duration::from_secs(2), read_udp_datagram_frame(&mut recv))
+                .await
+                .expect("third response should arrive after split frame suffix")?;
+        assert_eq!(udp_ip_header_target(&third_response.header)?, target_addr);
+        assert_eq!(third_response.payload, b"third response");
+        send.finish().map_err(TransportError::from)?;
+
+        target_task.await.map_err(TransportError::from)??;
+        let relayed = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("UDP-over-stream relay task should finish")??;
+        assert_eq!(relayed.target, target_addr);
+        assert_eq!(
+            relayed.bytes_from_client,
+            b"first".len() as u64 + b"second".len() as u64 + b"third".len() as u64
+        );
+        assert_eq!(
+            relayed.bytes_from_target,
+            b"second response".len() as u64 + b"third response".len() as u64
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_udp_over_stream_pins_target_from_first_datagram() -> Result<(), TransportError>
+    {
+        let pinned_target =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let other_target =
+            tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let pinned_addr = pinned_target.local_addr()?;
+        let other_addr = other_target.local_addr()?;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"udp pinned target password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
+        });
+        let pinned_target_task = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            for _ in 0..2 {
+                let (received, _) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    pinned_target.recv_from(&mut buffer),
+                )
+                .await
+                .expect("pinned target should receive both datagrams")?;
+                payloads.push(buffer[..received].to_vec());
+            }
+            Ok::<_, std::io::Error>(payloads)
+        });
+        let other_target_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 1024];
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                other_target.recv_from(&mut buffer),
+            )
+            .await
+            .is_err()
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let (mut send, _recv) = authenticated
+            .as_quinn()
+            .open_bi()
+            .await
+            .map_err(TransportError::from)?;
+        let pinned_header =
+            OwnedProxyHeader::from_ip(Network::Udp, pinned_addr.ip(), pinned_addr.port());
+        let other_header =
+            OwnedProxyHeader::from_ip(Network::Udp, other_addr.ip(), other_addr.port());
+        let encode_frame =
+            |header: &OwnedProxyHeader, payload: &[u8]| -> Result<Vec<u8>, TransportError> {
+                let header = header.as_borrowed();
+                let mut encoded =
+                    Vec::with_capacity(header.address.runtime_metadata_len() + 2 + payload.len());
+                encode_udp_datagram(&header, payload, &mut encoded)?;
+                Ok(encoded)
+            };
+
+        write_proxy_header(&mut send, &pinned_header).await?;
+        send.write_all(&encode_frame(&pinned_header, b"first target")?)
+            .await?;
+        send.write_all(&encode_frame(&other_header, b"still pinned")?)
+            .await?;
+        send.finish().map_err(TransportError::from)?;
+
+        let payloads = pinned_target_task.await.map_err(TransportError::from)??;
+        assert_eq!(
+            payloads,
+            vec![b"first target".to_vec(), b"still pinned".to_vec()]
+        );
+        assert!(
+            other_target_task.await.map_err(TransportError::from)?,
+            "later frame headers must not retarget a direct UDP-over-stream session"
+        );
+        let relayed = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("UDP-over-stream relay task should finish")??;
+        assert_eq!(relayed.target, pinned_addr);
+        assert_eq!(
+            relayed.bytes_from_client,
+            b"first target".len() as u64 + b"still pinned".len() as u64
+        );
+        assert_eq!(relayed.bytes_from_target, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_udp_over_stream_relays_delayed_target_reply_after_client_finish()
+    -> Result<(), TransportError> {
+        let target = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let target_addr = target.local_addr()?;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"udp delayed reply password";
+
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let authenticated = server.accept_authenticated(uuid, password).await?;
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
+        });
+        let target_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 1024];
+            let (received, relay_addr) = target.recv_from(&mut buffer).await?;
+            assert_eq!(&buffer[..received], b"finished request");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            target.send_to(b"delayed response", relay_addr).await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let authenticated = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+        let mut stream = authenticated
+            .open_udp_over_stream(target_addr.ip(), target_addr.port())
+            .await?;
+
+        stream.send_datagram(b"finished request").await?;
+        stream.finish()?;
+        let delayed_response =
+            tokio::time::timeout(Duration::from_secs(2), stream.recv_datagram(1024)).await;
+
+        target_task.await.map_err(TransportError::from)??;
+        let relayed = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("UDP-over-stream relay task should finish")??;
+        let delayed_response =
+            delayed_response.expect("delayed target response should arrive after client finish")?;
+        assert_eq!(delayed_response.target, target_addr);
+        assert_eq!(delayed_response.payload, b"delayed response");
+        assert_eq!(relayed.target, target_addr);
+        assert_eq!(relayed.bytes_from_client, b"finished request".len() as u64);
+        assert_eq!(relayed.bytes_from_target, b"delayed response".len() as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rust_rust_udp_over_stream_reaches_echo_target() -> Result<(), TransportError> {
         let echo = zuicity_testkit::UdpEchoServer::start()
             .await
@@ -13563,7 +14216,9 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let authenticated = server.accept_authenticated(uuid, password).await?;
-            authenticated.accept_udp_over_stream_once().await
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
         });
 
         let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
@@ -13615,7 +14270,9 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let authenticated = server.accept_authenticated(uuid, password).await?;
-            authenticated.accept_udp_over_stream_once().await
+            authenticated
+                .accept_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                .await
         });
 
         let client = JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
