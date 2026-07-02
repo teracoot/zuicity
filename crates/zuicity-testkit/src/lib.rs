@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, OpenOptions},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, atomic::Ordering},
@@ -302,7 +302,11 @@ pub struct UdpEchoServer {
 impl UdpEchoServer {
     /// Starts a UDP echo server bound to `127.0.0.1:0`.
     pub async fn start() -> anyhow::Result<Self> {
-        let std_socket = reserve_udp_socket()?;
+        Self::start_on(SocketAddr::from(([127, 0, 0, 1], 0)))
+    }
+
+    fn start_on(bind_addr: SocketAddr) -> anyhow::Result<Self> {
+        let std_socket = UdpSocket::bind(bind_addr)?;
         std_socket.set_nonblocking(true)?;
         let local_addr = std_socket.local_addr()?;
         let socket = tokio::net::UdpSocket::from_std(std_socket)?;
@@ -338,6 +342,70 @@ impl UdpEchoServer {
         let _ = self.shutdown.send(());
         self.task.await??;
         Ok(())
+    }
+}
+
+/// UDP echo server paired with a loopback domain target.
+#[derive(Debug)]
+pub struct UdpDomainEchoServer {
+    domain: String,
+    server: UdpEchoServer,
+}
+
+impl UdpDomainEchoServer {
+    /// Starts a UDP echo server on the loopback family selected for `domain`.
+    pub async fn start_loopback(domain: impl Into<String>) -> anyhow::Result<Self> {
+        let domain = domain.into();
+        let mut last_error = None;
+
+        let targets = tokio::net::lookup_host((domain.as_str(), 0))
+            .await?
+            .collect::<Vec<_>>();
+
+        for target in targets {
+            match UdpEchoServer::start_on(loopback_addr_for_family(target)) {
+                Ok(server) => return Ok(Self { domain, server }),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Err(anyhow::anyhow!(
+                "domain {domain} did not resolve to a loopback UDP target"
+            )),
+        }
+    }
+
+    /// Returns the domain name clients should use for the echo target.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Returns the domain target string clients should send to.
+    #[must_use]
+    pub fn domain_target(&self) -> String {
+        format!("{}:{}", self.domain, self.local_addr().port())
+    }
+
+    /// Returns the concrete address the echo server is bound to.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.server.local_addr()
+    }
+
+    /// Stops the server and waits for its task to exit.
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.server.shutdown().await
+    }
+}
+
+fn loopback_addr_for_family(target: SocketAddr) -> SocketAddr {
+    if target.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 0))
     }
 }
 
@@ -904,6 +972,21 @@ mod tests {
         let (n, from) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await??;
         assert_eq!(from, server.local_addr());
         assert_eq!(&buf[..n], b"juicity-udp");
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_domain_echo_server_round_trips_datagrams_and_shuts_down() -> anyhow::Result<()> {
+        let server = UdpDomainEchoServer::start_loopback("localhost").await?;
+        let client_addr = loopback_addr_for_family(server.local_addr());
+        let socket = tokio::net::UdpSocket::bind(client_addr).await?;
+        let target = server.domain_target();
+        socket.send_to(b"juicity-domain-udp", &target).await?;
+        let mut buf = [0_u8; 64];
+        let (n, from) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await??;
+        assert_eq!(from, server.local_addr());
+        assert_eq!(&buf[..n], b"juicity-domain-udp");
         server.shutdown().await?;
         Ok(())
     }

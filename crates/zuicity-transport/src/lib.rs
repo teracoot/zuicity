@@ -13798,7 +13798,7 @@ mod tests {
 
     #[tokio::test]
     async fn rust_rust_udp_over_stream_reaches_domain_echo_target() -> Result<(), TransportError> {
-        let echo = zuicity_testkit::UdpEchoServer::start()
+        let echo = zuicity_testkit::UdpDomainEchoServer::start_loopback("localhost")
             .await
             .expect("start UDP echo fixture");
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -13833,7 +13833,7 @@ mod tests {
             )
             .await?;
         let mut stream = authenticated
-            .open_udp_over_domain_stream("localhost", echo_addr.port())
+            .open_udp_over_domain_stream(echo.domain(), echo_addr.port())
             .await?;
         stream.send_datagram(b"udp domain ping").await?;
         let response = stream.recv_datagram(1024).await?;

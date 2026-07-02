@@ -2263,7 +2263,7 @@ mod tests {
         let password = "client udp domain forward password";
         let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
             .expect("generate fixture cert");
-        let echo = zuicity_testkit::UdpEchoServer::start()
+        let echo = zuicity_testkit::UdpDomainEchoServer::start_loopback("localhost")
             .await
             .expect("start UDP echo fixture");
         let server_runtime = zuicity_server::ServerRuntime::new(server_config(&format!(
@@ -2278,9 +2278,9 @@ mod tests {
         let server_task = tokio::spawn(async move { server.accept_one_udp_over_stream().await });
 
         let echo_addr = echo.local_addr();
+        let echo_target = echo.domain_target();
         let runtime = ClientRuntime::new(client_config(&format!(
-            r#"{{"server":"{server_addr}","uuid":"{uuid}","password":"{password}","sni":"server.local","forward":{{"127.0.0.1:0/udp":"localhost:{}"}}}}"#,
-            echo_addr.port()
+            r#"{{"server":"{server_addr}","uuid":"{uuid}","password":"{password}","sni":"server.local","forward":{{"127.0.0.1:0/udp":"{echo_target}"}}}}"#
         ))?);
         let mut forwarders = runtime
             .bind_configured_udp_forwarders_with_roots(cert.cert.pem().as_bytes())
