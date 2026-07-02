@@ -140,13 +140,13 @@ throughput without that failure mode:
   for other peers.
 - No persistent socket-level `UDP_SEGMENT` option is set (only per-message
   control messages). The receive path is unchanged (no GRO/ECN/PMTUDISC).
-- Mode is `Auto` by default on Linux; `ZUICITY_DISABLE_GSO=1` forces it off,
-  mirroring upstream Go's `QUIC_GO_DISABLE_GSO`.
+- Mode is off by default for release safety. `ZUICITY_ENABLE_GSO=1` opts in on
+  Linux; `ZUICITY_DISABLE_GSO=1` keeps it off even when enable is set.
 
-Cross-host verification showed GSO actually engaging on the veth path
-(`udp gso engaged dest=...` on both client and server) while the IPv4 basic,
-6-scenario comprehensive, and IPv6 suites all passed, proving the handshake
-reliability is preserved.
+Cross-host verification with `ZUICITY_ENABLE_GSO=1` showed GSO actually engaging
+on the veth path (`udp gso engaged dest=...` on both client and server) while
+the IPv4 basic, 6-scenario comprehensive, and IPv6 suites all passed, proving
+the handshake reliability is preserved.
 
 Effect: throughput ~306 -> ~678 -> ~762 Mbps (now ~1.9x Go).
 
@@ -242,10 +242,15 @@ throughput, latency, reliability, or compatibility regression.
 - Cross-host: `two-ns-runtime.sh`, `two-ns-comprehensive.sh`, `two-ns-ipv6.sh`
 - New regression tests: connection reuse (TCP and UDP), concurrent multi-UDP
   stream reuse, GSO fallback resends both datagrams and marks the destination
-  disabled, handshake survives a GSO-hostile path, long-header packets are neve
-  segmented.
+  disabled, handshake survives a GSO-hostile path, long-header packets are never
+  segmented. Run GSO-specific gates with `ZUICITY_ENABLE_GSO=1`; the default
+  release mode remains GSO off.
 
 ## Limitations
+
+The v0.2.2 server-only A/B evidence against the previous 0.2.1 server is stored
+under `docs/benchmark-evidence/v0.2.2/veth/` with raw performance/RSS JSONL and
+hashes.
 
 - Local single-host veth benchmark; absolute numbers differ on physical NICs and
   WAN links.

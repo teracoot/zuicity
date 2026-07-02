@@ -31,10 +31,10 @@ juicity deployments interoperate with it unchanged.
 - **Leaner.** About a third of the server resident memory of upstream Go juicity
   on a real WAN server (~13 MB vs ~37 MB), with no leak: resident memory plateaus
   under load and freezes flat when idle.
-- **Reliable.** Adaptive UDP GSO/GRO with per-destination fallback never strands
-  a QUIC handshake on GSO-hostile paths (veth, tun/VPN, virtio, many cloud NICs);
-  the cross-host suite passes over IPv4, IPv6, and a 6-scenario comprehensive
-  matrix.
+- **Reliable.** Release builds keep UDP GSO opt-in for path safety on hostile
+  egresses (veth, tun/VPN, virtio, many cloud NICs), while GRO remains
+  receive-only and wire-invisible; the cross-host suite passes over IPv4, IPv6,
+  and a 6-scenario comprehensive matrix.
 - **Compatible.** Verified live against a real upstream Go juicity **v0.5.0**
   server over the public Internet, including full system-root TLS validation.
 
@@ -96,7 +96,7 @@ A/B-tested and gated on cross-host correctness:
   `congestion_control=bbr` instead of silently falling back to CUBIC.
 - Concurrent per-stream relay on the server (Go's goroutine-per-stream model).
 - 64 KiB relay buffers and `TCP_NODELAY` on local and target sockets.
-- Adaptive Linux UDP GSO on send and GRO on receive.
+- Optional adaptive Linux UDP GSO on send and GRO on receive.
 - A non-blocking UDP send path that never blocks a runtime worker.
 
 ## Memory usage
@@ -119,14 +119,16 @@ size:
 
 ## Reliability
 
-- **Adaptive GSO/GRO with fallback.** UDP segmentation offload is attempted only
-  for post-handshake bulk packets and falls back, in the same send call, to
-  plain datagrams on `EINVAL`/`EIO`, per destination. QUIC handshake packets are
-  never segmented, so the handshake always completes even on GSO-hostile paths.
+- **Adaptive GSO/GRO with fallback.** UDP segmentation offload is off by default
+  for release safety. `ZUICITY_ENABLE_GSO=1` opts in on Linux, and eligible
+  post-handshake bulk packets fall back, in the same send call, to plain
+  datagrams on `EINVAL`/`EIO`, per destination. QUIC handshake packets are never
+  segmented, so the handshake always completes even on GSO-hostile paths.
 - **Connection-loss handling.** A peer that disappears is treated as a clean
   connection close rather than a hard error.
 - **Cross-host validation.** The two-namespace runtime, 6-scenario
-  comprehensive, and IPv6 suites all pass with GSO/GRO engaged.
+  comprehensive, and IPv6 suites pass with default-safe send behavior and with
+  opt-in GSO/GRO engaged.
 
 ## Compatibility
 
