@@ -4362,12 +4362,17 @@ mod tests {
             key_pem.as_bytes(),
         )?;
         let server_addr = bound.local_addr()?;
+        let metrics = ServerMetrics::default();
+        let hooks = ServerRuntimeHooks::new(metrics.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
             bound
-                .run_proxy_loop_until(async {
-                    let _ = shutdown_rx.await;
-                })
+                .run_proxy_loop_until_with_hooks(
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    hooks,
+                )
                 .await
         });
 
@@ -4448,7 +4453,13 @@ mod tests {
             expected_bytes += bytes;
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let completed = wait_for_server_metrics(&metrics, |snapshot| {
+            snapshot.completed_tcp_relays == 4
+                && snapshot.completed_udp_relays == 4
+                && snapshot.active_connections == 0
+        })
+        .await;
+        assert_eq!(completed.accepted_connections, 8);
         shutdown_tx.send(()).expect("send shutdown");
         let report = server_task.await??;
         assert_eq!(tcp_relays, 4);

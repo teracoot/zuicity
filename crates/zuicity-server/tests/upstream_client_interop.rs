@@ -324,57 +324,89 @@ async fn start_socks5_udp_associate_proxy() -> std::io::Result<(
             .await?;
 
         let mut datagram = vec![0_u8; 65_535];
-        let (received, client_udp_addr) = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            udp.recv_from(&mut datagram),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no UDP packet"))??;
-        if received < 10 || datagram[..4] != [0x00, 0x00, 0x00, 0x01] {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid SOCKS5 UDP datagram header",
-            ));
-        }
-        let target = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(
-                datagram[4],
-                datagram[5],
-                datagram[6],
-                datagram[7],
-            )),
-            u16::from_be_bytes([datagram[8], datagram[9]]),
-        );
-        let payload = datagram[10..received].to_vec();
-        request_tx
-            .send(Socks5UdpAssociateRequest { target })
+        loop {
+            let (received, client_udp_addr) = tokio::select! {
+                received = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    udp.recv_from(&mut datagram),
+                ) => match received {
+                    Ok(received) => received?,
+                    Err(_) => continue,
+                },
+                control_result = control.readable() => {
+                    control_result?;
+                    let mut control_byte = [0_u8; 1];
+                    match control.try_read(&mut control_byte) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "unexpected data on SOCKS5 UDP control connection",
+                            ));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            if received < 10 || datagram[..4] != [0x00, 0x00, 0x00, 0x01] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid SOCKS5 UDP datagram header",
+                ));
+            }
+            let target = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    datagram[4],
+                    datagram[5],
+                    datagram[6],
+                    datagram[7],
+                )),
+                u16::from_be_bytes([datagram[8], datagram[9]]),
+            );
+            let payload = datagram[10..received].to_vec();
+            request_tx
+                .send(Socks5UdpAssociateRequest { target })
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "request channel closed")
+                })?;
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                udp.send_to(&payload, target),
+            )
             .await
             .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "request channel closed")
-            })?;
-
-        udp.send_to(&payload, target).await?;
-        let (response_len, response_peer) = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            udp.recv_from(&mut datagram),
-        )
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no UDP response"))??;
-        let IpAddr::V4(peer_ip) = response_peer.ip() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "test proxy only supports IPv4 UDP responses",
-            ));
-        };
-        let peer_port = response_peer.port().to_be_bytes();
-        let mut encoded = Vec::with_capacity(10 + response_len);
-        encoded.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        encoded.extend_from_slice(&peer_ip.octets());
-        encoded.extend_from_slice(&peer_port);
-        encoded.extend_from_slice(&datagram[..response_len]);
-        udp.send_to(&encoded, client_udp_addr).await?;
-        let mut drain = [0_u8; 1];
-        let _ = control.read(&mut drain).await;
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP send timed out")
+            })??;
+            let (response_len, response_peer) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                udp.recv_from(&mut datagram),
+            )
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no UDP response"))??;
+            let IpAddr::V4(peer_ip) = response_peer.ip() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test proxy only supports IPv4 UDP responses",
+                ));
+            };
+            let peer_port = response_peer.port().to_be_bytes();
+            let mut encoded = Vec::with_capacity(10 + response_len);
+            encoded.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            encoded.extend_from_slice(&peer_ip.octets());
+            encoded.extend_from_slice(&peer_port);
+            encoded.extend_from_slice(&datagram[..response_len]);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                udp.send_to(&encoded, client_udp_addr),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "UDP response send timed out")
+            })??;
+        }
         Ok(())
     });
     Ok((local_addr, request_rx, task))
@@ -1060,29 +1092,56 @@ async fn upstream_client_forwarder_reaches_rust_server_udp_echo_through_socks5_d
     )?;
 
     let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let payload = b"upstream client rust server udp dialer link";
-    let deadline = Instant::now() + INTEROP_TIMEOUT;
+    let first_payload = b"upstream client rust server udp dialer link first payload";
+    let first_deadline = Instant::now() + INTEROP_TIMEOUT;
     let mut buf = [0_u8; 1024];
     loop {
-        socket.send_to(payload, forward_addr).await?;
+        socket.send_to(first_payload, forward_addr).await?;
         match timeout(Duration::from_millis(250), socket.recv_from(&mut buf)).await {
             Ok(Ok((received, from))) => {
                 assert_eq!(from, forward_addr);
-                assert_eq!(&buf[..received], payload);
+                assert_eq!(&buf[..received], first_payload);
                 break;
             }
             Ok(Err(error)) => return Err(error.into()),
-            Err(_) if Instant::now() < deadline => {}
+            Err(_) if Instant::now() < first_deadline => {}
             Err(_) => {
-                return Err("timed out waiting for upstream client UDP dialer_link echo".into());
+                return Err(
+                    "timed out waiting for first upstream client UDP dialer_link echo".into(),
+                );
             }
         }
     }
 
-    let request = timeout(INTEROP_TIMEOUT, requests.recv())
+    let first_request = timeout(INTEROP_TIMEOUT, requests.recv())
         .await?
         .ok_or("SOCKS5 proxy request channel closed")?;
-    assert_eq!(request.target, echo.local_addr());
+    assert_eq!(first_request.target, echo.local_addr());
+
+    let second_payload = b"upstream client rust server udp dialer link second payload";
+    let second_deadline = Instant::now() + INTEROP_TIMEOUT;
+    loop {
+        socket.send_to(second_payload, forward_addr).await?;
+        match timeout(Duration::from_millis(250), socket.recv_from(&mut buf)).await {
+            Ok(Ok((received, from))) => {
+                assert_eq!(from, forward_addr);
+                assert_eq!(&buf[..received], second_payload);
+                break;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) if Instant::now() < second_deadline => {}
+            Err(_) => {
+                return Err(
+                    "timed out waiting for second upstream client UDP dialer_link echo".into(),
+                );
+            }
+        }
+    }
+
+    let second_request = timeout(INTEROP_TIMEOUT, requests.recv())
+        .await?
+        .ok_or("SOCKS5 proxy request channel closed")?;
+    assert_eq!(second_request.target, echo.local_addr());
 
     let exit = upstream.terminate(PROCESS_EXIT_TIMEOUT)?;
     fs::write(
@@ -1092,8 +1151,8 @@ async fn upstream_client_forwarder_reaches_rust_server_udp_echo_through_socks5_d
 
     let report = timeout(INTEROP_TIMEOUT, server_task).await???;
     assert_eq!(report.target, echo.local_addr());
-    assert!(report.bytes_from_client >= payload.len() as u64);
-    assert!(report.bytes_from_target >= payload.len() as u64);
+    assert!(report.bytes_from_client >= (first_payload.len() + second_payload.len()) as u64);
+    assert!(report.bytes_from_target >= (first_payload.len() + second_payload.len()) as u64);
     proxy_task.await??;
     echo.shutdown().await?;
     Ok(())
