@@ -18,11 +18,12 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
         policy.streams.max_incoming_uni_streams as u32,
     ));
     inner.stream_receive_window(quinn::VarInt::from_u32(
-        policy.receive_windows.initial_stream as u32,
+        policy.receive_windows.max_stream as u32,
     ));
     inner.receive_window(quinn::VarInt::from_u32(
-        policy.receive_windows.initial_connection as u32,
+        policy.receive_windows.max_connection as u32,
     ));
+    inner.send_window(policy.receive_windows.max_connection);
     inner.keep_alive_interval(Some(policy.keep_alive));
     inner.max_idle_timeout(
         policy

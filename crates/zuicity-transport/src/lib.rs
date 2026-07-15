@@ -99,7 +99,7 @@ pub use vmess_dialer::VmessDialerLink;
 /// Per-direction relay copy buffer. Larger than tokio::io::copy's 8 KiB default
 /// so bulk transfers hand the QUIC stack and the kernel socket large write
 /// batches, cutting syscall and stream-frame overhead on high-throughput flows.
-const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
+const RELAY_COPY_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Upstream TUIC command-frame version used by daeuniverse/outbound.
 const TUIC_VERSION_5: u8 = 0x05;
@@ -6794,12 +6794,13 @@ mod tests {
         );
         assert_eq!(
             client.stream_receive_window(),
-            quinn::VarInt::from_u32(INITIAL_STREAM_RECEIVE_WINDOW as u32)
+            quinn::VarInt::from_u32(MAX_STREAM_RECEIVE_WINDOW as u32)
         );
         assert_eq!(
             client.receive_window(),
-            quinn::VarInt::from_u32(INITIAL_CONNECTION_RECEIVE_WINDOW as u32)
+            quinn::VarInt::from_u32(MAX_CONNECTION_RECEIVE_WINDOW as u32)
         );
+        assert_eq!(client.send_window(), MAX_CONNECTION_RECEIVE_WINDOW);
         assert_eq!(client.keep_alive_interval(), Some(CLIENT_KEEP_ALIVE));
         assert!(client.datagram_receive_buffer_size().is_none());
 

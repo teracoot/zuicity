@@ -228,13 +228,19 @@ impl BuiltTransportConfig {
     /// Returns the configured stream receive window.
     #[must_use]
     pub const fn stream_receive_window(&self) -> quinn::VarInt {
-        quinn::VarInt::from_u32(INITIAL_STREAM_RECEIVE_WINDOW as u32)
+        quinn::VarInt::from_u32(self.policy.receive_windows.max_stream as u32)
     }
 
     /// Returns the configured connection receive window.
     #[must_use]
     pub const fn receive_window(&self) -> quinn::VarInt {
-        quinn::VarInt::from_u32(INITIAL_CONNECTION_RECEIVE_WINDOW as u32)
+        quinn::VarInt::from_u32(self.policy.receive_windows.max_connection as u32)
+    }
+
+    /// Returns the configured send window.
+    #[must_use]
+    pub const fn send_window(&self) -> u64 {
+        self.policy.receive_windows.max_connection
     }
 
     /// Returns the configured keepalive interval.
