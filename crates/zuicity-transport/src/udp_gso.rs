@@ -23,32 +23,48 @@ impl PlainUdpSocket {
         }
     }
 
-    /// Sends `transmit` as plain datagrams, one per segment. Each datagram is
-    /// written with a raw nonblocking `sendto` on the socket's fd (via
-    /// `socket2`), deliberately bypassing tokio's cached write-readiness: a
-    /// freshly registered socket reports `Ready::EMPTY` until the reactor
-    /// delivers a writable event, so `UdpSocket::try_send_to`/`try_io` would
-    /// short-circuit to a spurious `WouldBlock` without ever issuing the
-    /// syscall. The raw send always attempts the syscall, so this path delivers
-    /// every datagram when called outside quinn's `poll_writable` loop (e.g.
-    /// directly from tests). On a genuine kernel `EAGAIN` (full send buffer) it
-    /// returns `WouldBlock` to the caller: quinn then re-arms writable readiness
-    /// through [`crate::PlainUdpPoller::poll_writable`] (`poll_send_ready`) and retries
-    /// the whole transmit, the documented quinn contract. It never sleeps the
-    /// worker thread, so rapid concurrent connects are not starved. This is the
-    /// historical safe path used for handshake/long-header packets,
-    /// [`GsoMode::Off`], and after a GSO fallback; it never drops a datagram.
+    /// Sends `transmit` as plain datagrams, one per segment. Non-Linux targets
+    /// retain the historical nonblocking `sendto` loop. Linux routes grouped
+    /// transmits through one safe `sendmmsg` and owns any suffix accepted for
+    /// recovery after a positive prefix. No plain path emits `UDP_SEGMENT`.
+    #[cfg(not(target_os = "linux"))]
     pub(super) fn send_plain_chunks(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
         let segment = transmit
             .segment_size
             .unwrap_or(transmit.contents.len())
             .max(1);
-        let socket = socket2::SockRef::from(&self.io);
+        let socket = socket2::SockRef::from(self.io.as_ref());
         let destination = socket2::SockAddr::from(transmit.destination);
         for chunk in transmit.contents.chunks(segment) {
             socket.send_to(chunk, &destination)?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn send_plain_chunks(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        if transmit.contents.is_empty() {
+            return Ok(());
+        }
+        let segment = transmit
+            .segment_size
+            .unwrap_or(transmit.contents.len())
+            .max(1);
+        if transmit.contents.chunks(segment).len() > 1 {
+            return crate::udp_plain_direct::send(
+                &self.plain_batch_io,
+                self.plain_counters.as_ref(),
+                transmit,
+            );
+        }
+        let socket = socket2::SockRef::from(self.plain_batch_io.socket());
+        let destination = socket2::SockAddr::from(transmit.destination);
+        let sent = socket.send_to(transmit.contents, &destination)?;
+        if sent == transmit.contents.len() {
+            Ok(())
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+        }
     }
 
     /// Returns true if any segment in this transmit is a QUIC long-header
@@ -71,12 +87,12 @@ impl PlainUdpSocket {
             return Err(forced);
         }
         let Some(sender) = self.gso_sender.as_ref() else {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            return Err(std::io::Error::from(rustix::io::Errno::INVAL));
         };
         // `try_send` emits the per-message `UDP_SEGMENT` cmsg on the target fd
         // and returns the raw `sendmsg` error (unlike `send`, which swallows
         // EINVAL/EIO), so we can run our own per-destination fallback.
-        sender.try_send((&self.io).into(), transmit)
+        sender.try_send((self.io.as_ref()).into(), transmit)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -89,14 +105,14 @@ impl PlainUdpSocket {
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn forced_gso_failure(&self) -> Option<std::io::Error> {
         match self.test_hook {
-            GsoTestHook::AlwaysEinval => Some(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            GsoTestHook::AlwaysEinval => Some(std::io::Error::from(rustix::io::Errno::INVAL)),
             GsoTestHook::FirstEinval => {
                 static FIRST_DONE: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 FIRST_DONE
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
-                    .then(|| std::io::Error::from_raw_os_error(libc::EINVAL))
+                    .then(|| std::io::Error::from(rustix::io::Errno::INVAL))
             }
             GsoTestHook::None => None,
         }
@@ -112,7 +128,10 @@ impl PlainUdpSocket {
 /// disable GSO for the destination and trigger a plain-datagram fallback.
 #[cfg(target_os = "linux")]
 pub(super) fn is_gso_rejection(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::EIO))
+    matches!(
+        rustix::io::Errno::from_io_error(error),
+        Some(rustix::io::Errno::INVAL | rustix::io::Errno::IO)
+    )
 }
 
 /// Returns the process-wide per-message GSO sender, building it at most once.

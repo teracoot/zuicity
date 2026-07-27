@@ -3,7 +3,7 @@ use std::{io::Cursor, sync::Arc};
 use zuicity_protocol::ALPN_H3;
 
 use crate::{
-    BuiltTransportConfig, CongestionController, GsoMode, QuicRuntimePolicy, TransportError,
+    BuiltTransportConfig, CongestionController, QuicRuntimePolicy, TransportError,
     tls_verify::{NoCertificateVerification, PinnedCertChainVerification},
 };
 
@@ -44,14 +44,14 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
     // then attempts a single per-message `UDP_SEGMENT` sendmsg with same-call
     // fallback, and never segments long-header (Initial/Handshake) packets, so
     // GSO-hostile paths (quinn-rs/quinn#2575, #2202) cannot strand the
-    // handshake. Unless `ZUICITY_ENABLE_GSO=1` opts in on Linux, segmentation is
-    // disabled and every transmit is one datagram, matching upstream Go quic-go
-    // behaviour.
-    inner.enable_segmentation_offload(matches!(GsoMode::from_env(), GsoMode::Auto));
+    let segmentation_offload_enabled = cfg!(target_os = "linux");
+    inner.enable_segmentation_offload(segmentation_offload_enabled);
     apply_congestion_controller(&mut inner, policy);
     BuiltTransportConfig {
         inner,
         policy: policy.clone(),
+        #[cfg(test)]
+        segmentation_offload_enabled,
     }
 }
 

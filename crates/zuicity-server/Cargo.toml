@@ -20,8 +20,10 @@ zuicity-protocol = { path = "../zuicity-protocol" }
 zuicity-transport = { path = "../zuicity-transport" }
 
 uuid.workspace = true
+
 [dev-dependencies]
 base64.workspace = true
+quinn.workspace = true
 zuicity-testkit = { path = "../zuicity-testkit" }
 rcgen.workspace = true
 shadowsocks.workspace = true

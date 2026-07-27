@@ -1,18 +1,19 @@
 //! Embeddable Zuicity server runtime boundaries.
 
 use std::{
+    collections::HashMap,
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering as AtomicOrdering},
     time::Duration,
 };
 
 use zuicity_config::ServerConfig;
 use zuicity_protocol::AtomicCounter64;
 use zuicity_transport::{
-    DEFAULT_NAT_TIMEOUT, JuicityQuicServer, ProxyEgressPolicy, ProxyProtocol, ProxyRelayReport,
-    QuicRuntimePolicy, StreamPolicy, TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
-    run_tuic_udp_datagram_relay,
+    DEFAULT_NAT_TIMEOUT, JuicityQuicServer, MAX_PENDING_SERVER_AUTHENTICATIONS, ProxyEgressPolicy,
+    ProxyProtocol, ProxyRelayReport, QuicRuntimePolicy, StreamPolicy, TcpProxyRelayReport,
+    TlsPolicy, UdpOverStreamRelayReport, run_tuic_udp_datagram_relay,
 };
 
 const PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
@@ -23,6 +24,16 @@ const PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 // their final bytes, then force-aborts the wedged ones so the connection task can
 // never hang on a stuck relay (the leak that grew unbounded under load).
 const PROXY_CONNECTION_CLOSE_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Handshake and authentication are concurrent, but admission is bounded so a
+// flood of silent or partial pre-auth peers cannot monopolize the accept path
+// or retain unbounded unauthenticated connection state.
+// Half of the global budget remains available to other addresses while still
+// allowing large dae deployments behind one public NAT to authenticate in a
+// burst.
+const MAX_PENDING_AUTHENTICATIONS: usize = MAX_PENDING_SERVER_AUTHENTICATIONS;
+const MAX_PENDING_AUTHENTICATIONS_PER_IP: usize = MAX_PENDING_AUTHENTICATIONS / 2;
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Server runtime options independent from CLI parsing.
 #[derive(Clone, Debug)]
@@ -173,24 +184,24 @@ impl ServerMetrics {
     pub fn connection_accepted(&self) {
         self.inner
             .accepted_connections
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.inner
             .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Records a rejected authentication attempt.
     pub fn connection_rejected(&self) {
         self.inner
             .rejected_connections
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Records a completed authenticated QUIC connection lifecycle.
     pub fn connection_closed(&self) {
         self.inner
             .active_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |value| {
                 value.checked_sub(1)
             })
             .ok();
@@ -200,7 +211,7 @@ impl ServerMetrics {
     pub fn tcp_relay_completed(&self, bytes_from_client: u64, bytes_from_target: u64) {
         self.inner
             .completed_tcp_relays
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.bytes_from_client(bytes_from_client);
         self.bytes_from_target(bytes_from_target);
     }
@@ -209,7 +220,7 @@ impl ServerMetrics {
     pub fn udp_relay_completed(&self, bytes_from_client: u64, bytes_from_target: u64) {
         self.inner
             .completed_udp_relays
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.bytes_from_client(bytes_from_client);
         self.bytes_from_target(bytes_from_target);
     }
@@ -218,35 +229,50 @@ impl ServerMetrics {
     pub fn proxy_stream_failed(&self) {
         self.inner
             .failed_proxy_streams
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Records bytes copied from Juicity clients to target endpoints.
     pub fn bytes_from_client(&self, bytes: u64) {
         self.inner
             .bytes_from_client
-            .fetch_add(bytes, Ordering::Relaxed);
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
     }
 
     /// Records bytes copied from target endpoints back to Juicity clients.
     pub fn bytes_from_target(&self, bytes: u64) {
         self.inner
             .bytes_from_target
-            .fetch_add(bytes, Ordering::Relaxed);
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
     }
 
     /// Returns a stable point-in-time server metrics snapshot.
     #[must_use]
     pub fn snapshot(&self) -> ServerMetricsSnapshot {
         ServerMetricsSnapshot {
-            accepted_connections: self.inner.accepted_connections.load(Ordering::Relaxed),
-            rejected_connections: self.inner.rejected_connections.load(Ordering::Relaxed),
-            active_connections: self.inner.active_connections.load(Ordering::Relaxed),
-            completed_tcp_relays: self.inner.completed_tcp_relays.load(Ordering::Relaxed),
-            completed_udp_relays: self.inner.completed_udp_relays.load(Ordering::Relaxed),
-            failed_proxy_streams: self.inner.failed_proxy_streams.load(Ordering::Relaxed),
-            bytes_from_client: self.inner.bytes_from_client.load(Ordering::Relaxed),
-            bytes_from_target: self.inner.bytes_from_target.load(Ordering::Relaxed),
+            accepted_connections: self
+                .inner
+                .accepted_connections
+                .load(AtomicOrdering::Relaxed),
+            rejected_connections: self
+                .inner
+                .rejected_connections
+                .load(AtomicOrdering::Relaxed),
+            active_connections: self.inner.active_connections.load(AtomicOrdering::Relaxed),
+            completed_tcp_relays: self
+                .inner
+                .completed_tcp_relays
+                .load(AtomicOrdering::Relaxed),
+            completed_udp_relays: self
+                .inner
+                .completed_udp_relays
+                .load(AtomicOrdering::Relaxed),
+            failed_proxy_streams: self
+                .inner
+                .failed_proxy_streams
+                .load(AtomicOrdering::Relaxed),
+            bytes_from_client: self.inner.bytes_from_client.load(AtomicOrdering::Relaxed),
+            bytes_from_target: self.inner.bytes_from_target.load(AtomicOrdering::Relaxed),
         }
     }
 }
@@ -386,9 +412,14 @@ impl BoundServerRuntime {
         shutdown: impl Future<Output = ()>,
         hooks: ServerRuntimeHooks,
     ) -> Result<ServerTcpLoopReport, ServerError> {
+        if self.users.is_empty() {
+            return Err(ServerError::NoUsersConfigured);
+        }
         let mut shutdown = std::pin::pin!(shutdown);
-        let users = std::sync::Arc::new(self.users.clone());
-        let mut accept_task = spawn_authenticated_accept_task(&self.server, &users);
+        let users = Arc::new(self.users.clone());
+        let admission = PreAuthAdmission::new();
+        let mut accept_task = spawn_incoming_accept_task(&self.server);
+        let mut authentication_tasks = tokio::task::JoinSet::new();
         let mut relay_tasks = tokio::task::JoinSet::new();
         let mut report = ServerTcpLoopReport::default();
         let mut accepting = true;
@@ -399,10 +430,11 @@ impl BoundServerRuntime {
                 () = &mut shutdown, if accepting => {
                     accepting = false;
                     accept_task.abort();
+                    abort_and_drain_authentication_tasks(&mut authentication_tasks).await;
                 }
-                accepted = &mut accept_task, if accepting => {
-                    match accepted {
-                        Ok(Ok(connection)) => {
+                authenticated = authentication_tasks.join_next(), if accepting && !authentication_tasks.is_empty() => {
+                    match authenticated {
+                        Some(Ok(AuthenticationTaskResult { result: Ok(connection), .. })) => {
                             report.accepted_connections += 1;
                             let connection_guard = hooks.connection_accepted();
                             let egress = self.egress.clone();
@@ -416,11 +448,49 @@ impl BoundServerRuntime {
                                 Ok::<_, ServerError>(relay)
                             });
                         }
-                        Ok(Err(ServerError::Transport(error))) if proxy_connection_closed(&error) => {}
-                        Ok(Err(error)) => return Err(error),
+                        Some(Ok(AuthenticationTaskResult { result: Err(error), .. })) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                            }
+                        }
+                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) => return Err(error.into()),
+                        None => {}
+                    }
+                }
+                accepted = &mut accept_task, if accepting && admission.has_global_capacity() => {
+                    match accepted {
+                        Ok(Ok(incoming)) => {
+                            match admission.try_admit(incoming.remote_address().ip()) {
+                                Ok(permit) => {
+                                    authentication_tasks.spawn(authenticate_incoming_connection(
+                                        incoming,
+                                        Arc::clone(&users),
+                                        permit,
+                                    ));
+                                }
+                                Err(()) => {
+                                    tracing::debug!(
+                                        error = "authentication admission saturated",
+                                        "handleAuth"
+                                    );
+                                    incoming.refuse();
+                                    hooks.connection_rejected();
+                                }
+                            }
+                        }
+                        Ok(Err(error)) if is_fatal_accept_error(&error) => return Err(error),
+                        Ok(Err(error)) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                            }
+                        }
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => return Err(error.into()),
                     }
-                    accept_task = spawn_authenticated_accept_task(&self.server, &users);
+                    accept_task = spawn_incoming_accept_task(&self.server);
                 }
                 joined = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
                     if let Some(relay) = joined {
@@ -433,6 +503,7 @@ impl BoundServerRuntime {
                             }
                             Ok(Err(ServerError::Transport(error))) if proxy_connection_closed(&error) => {}
                             Ok(Err(error)) => return Err(error),
+                            Err(error) if error.is_cancelled() => {}
                             Err(error) => return Err(error.into()),
                         }
                     }
@@ -461,9 +532,14 @@ impl BoundServerRuntime {
         shutdown: impl Future<Output = ()>,
         hooks: ServerRuntimeHooks,
     ) -> Result<ServerUdpLoopReport, ServerError> {
+        if self.users.is_empty() {
+            return Err(ServerError::NoUsersConfigured);
+        }
         let mut shutdown = std::pin::pin!(shutdown);
-        let users = std::sync::Arc::new(self.users.clone());
-        let mut accept_task = spawn_authenticated_accept_task(&self.server, &users);
+        let users = Arc::new(self.users.clone());
+        let admission = PreAuthAdmission::new();
+        let mut accept_task = spawn_incoming_accept_task(&self.server);
+        let mut authentication_tasks = tokio::task::JoinSet::new();
         let mut relay_tasks = tokio::task::JoinSet::new();
         let mut report = ServerUdpLoopReport::default();
         let mut accepting = true;
@@ -474,10 +550,11 @@ impl BoundServerRuntime {
                 () = &mut shutdown, if accepting => {
                     accepting = false;
                     accept_task.abort();
+                    abort_and_drain_authentication_tasks(&mut authentication_tasks).await;
                 }
-                accepted = &mut accept_task, if accepting => {
-                    match accepted {
-                        Ok(Ok(connection)) => {
+                authenticated = authentication_tasks.join_next(), if accepting && !authentication_tasks.is_empty() => {
+                    match authenticated {
+                        Some(Ok(AuthenticationTaskResult { result: Ok(connection), .. })) => {
                             report.accepted_connections += 1;
                             let connection_guard = hooks.connection_accepted();
                             let egress = self.egress.clone();
@@ -487,11 +564,49 @@ impl BoundServerRuntime {
                                 run_udp_over_stream_connection(connection, egress, relay_hooks).await
                             });
                         }
-                        Ok(Err(ServerError::Transport(error))) if proxy_connection_closed(&error) => {}
-                        Ok(Err(error)) => return Err(error),
+                        Some(Ok(AuthenticationTaskResult { result: Err(error), .. })) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                            }
+                        }
+                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) => return Err(error.into()),
+                        None => {}
+                    }
+                }
+                accepted = &mut accept_task, if accepting && admission.has_global_capacity() => {
+                    match accepted {
+                        Ok(Ok(incoming)) => {
+                            match admission.try_admit(incoming.remote_address().ip()) {
+                                Ok(permit) => {
+                                    authentication_tasks.spawn(authenticate_incoming_connection(
+                                        incoming,
+                                        Arc::clone(&users),
+                                        permit,
+                                    ));
+                                }
+                                Err(()) => {
+                                    tracing::debug!(
+                                        error = "authentication admission saturated",
+                                        "handleAuth"
+                                    );
+                                    incoming.refuse();
+                                    hooks.connection_rejected();
+                                }
+                            }
+                        }
+                        Ok(Err(error)) if is_fatal_accept_error(&error) => return Err(error),
+                        Ok(Err(error)) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                            }
+                        }
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => return Err(error.into()),
                     }
-                    accept_task = spawn_authenticated_accept_task(&self.server, &users);
+                    accept_task = spawn_incoming_accept_task(&self.server);
                 }
                 joined = relay_tasks.join_next(), if !relay_tasks.is_empty() => {
                     if let Some(relay) = joined {
@@ -503,6 +618,7 @@ impl BoundServerRuntime {
                             }
                             Ok(Err(ServerError::Transport(error))) if proxy_connection_closed(&error) => {}
                             Ok(Err(error)) => return Err(error),
+                            Err(error) if error.is_cancelled() => {}
                             Err(error) => return Err(error.into()),
                         }
                     }
@@ -531,10 +647,15 @@ impl BoundServerRuntime {
         shutdown: impl Future<Output = ()>,
         hooks: ServerRuntimeHooks,
     ) -> Result<ServerProxyLoopReport, ServerError> {
+        if self.users.is_empty() {
+            return Err(ServerError::NoUsersConfigured);
+        }
         let mut shutdown = std::pin::pin!(shutdown);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        let users = std::sync::Arc::new(self.users.clone());
-        let mut accept_task = spawn_authenticated_accept_task(&self.server, &users);
+        let users = Arc::new(self.users.clone());
+        let admission = PreAuthAdmission::new();
+        let mut accept_task = spawn_incoming_accept_task(&self.server);
+        let mut authentication_tasks = tokio::task::JoinSet::new();
         let mut tasks = tokio::task::JoinSet::new();
         let mut report = ServerProxyLoopReport::default();
         let mut accepting = true;
@@ -545,11 +666,12 @@ impl BoundServerRuntime {
                 () = &mut shutdown, if accepting => {
                     accepting = false;
                     accept_task.abort();
+                    abort_and_drain_authentication_tasks(&mut authentication_tasks).await;
                     let _ = shutdown_tx.send(true);
                 }
-                accepted = &mut accept_task, if accepting => {
-                    match accepted {
-                        Ok(Ok(connection)) => {
+                authenticated = authentication_tasks.join_next(), if accepting && !authentication_tasks.is_empty() => {
+                    match authenticated {
+                        Some(Ok(AuthenticationTaskResult { result: Ok(connection), .. })) => {
                             report.accepted_connections += 1;
                             let connection_guard = hooks.connection_accepted();
                             let shutdown_rx = shutdown_tx.subscribe();
@@ -565,19 +687,61 @@ impl BoundServerRuntime {
                                 ).await
                             });
                         }
-                        Ok(Err(ServerError::Transport(zuicity_transport::TransportError::AuthenticationRejected))) => {
-                            hooks.connection_rejected();
-                            report.rejected_connections += 1;
+                        Some(Ok(AuthenticationTaskResult { result: Err(error), .. })) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                                report.rejected_connections += 1;
+                            }
                         }
-                        Ok(Err(ServerError::Transport(error))) if proxy_connection_closed(&error) => {}
-                        Ok(Err(error)) => return Err(error),
+                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) => return Err(error.into()),
+                        None => {}
+                    }
+                }
+                accepted = &mut accept_task, if accepting && admission.has_global_capacity() => {
+                    match accepted {
+                        Ok(Ok(incoming)) => {
+                            match admission.try_admit(incoming.remote_address().ip()) {
+                                Ok(permit) => {
+                                    authentication_tasks.spawn(authenticate_incoming_connection(
+                                        incoming,
+                                        Arc::clone(&users),
+                                        permit,
+                                    ));
+                                }
+                                Err(()) => {
+                                    tracing::debug!(
+                                        error = "authentication admission saturated",
+                                        "handleAuth"
+                                    );
+                                    incoming.refuse();
+                                    hooks.connection_rejected();
+                                    report.rejected_connections += 1;
+                                }
+                            }
+                        }
+                        Ok(Err(error)) if is_fatal_accept_error(&error) => return Err(error),
+                        Ok(Err(error)) => {
+                            if !is_ignorable_pre_auth_error(&error) {
+                                trace_authenticated_accept_error(&error);
+                                hooks.connection_rejected();
+                                report.rejected_connections += 1;
+                            }
+                        }
+                        Err(error) if error.is_cancelled() => {}
                         Err(error) => return Err(error.into()),
                     }
-                    accept_task = spawn_authenticated_accept_task(&self.server, &users);
+                    accept_task = spawn_incoming_accept_task(&self.server);
                 }
                 joined = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(connection_report) = joined {
-                        report.merge(connection_report??);
+                        match connection_report {
+                            Ok(Ok(connection_report)) => report.merge(connection_report),
+                            Ok(Err(error)) => return Err(error),
+                            Err(error) if error.is_cancelled() => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                 }
                 else => {
@@ -684,35 +848,134 @@ pub struct ServerProxyLoopReport {
     pub bytes_from_target: u64,
 }
 
-fn spawn_authenticated_accept_task(
+fn spawn_incoming_accept_task(
     server: &JuicityQuicServer,
-    users: &std::sync::Arc<Vec<(uuid::Uuid, String)>>,
-) -> tokio::task::JoinHandle<Result<zuicity_transport::AuthenticatedConnection, ServerError>> {
-    tokio::spawn(accept_authenticated_connection(
-        server.clone(),
-        std::sync::Arc::clone(users),
-    ))
+) -> tokio::task::JoinHandle<Result<zuicity_transport::JuicityIncomingConnection, ServerError>> {
+    let server = server.clone();
+    tokio::spawn(async move { server.accept_incoming().await.map_err(ServerError::from) })
 }
 
-async fn accept_authenticated_connection(
-    server: JuicityQuicServer,
-    users: std::sync::Arc<Vec<(uuid::Uuid, String)>>,
-) -> Result<zuicity_transport::AuthenticatedConnection, ServerError> {
-    if users.is_empty() {
-        return Err(ServerError::NoUsersConfigured);
+#[derive(Default)]
+struct PreAuthAdmissionState {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+#[derive(Clone, Default)]
+struct PreAuthAdmission {
+    state: Arc<Mutex<PreAuthAdmissionState>>,
+}
+
+impl PreAuthAdmission {
+    fn new() -> Self {
+        Self::default()
     }
-    let accepted = server
-        .accept_authenticated_with(
+
+    fn has_global_capacity(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.total < MAX_PENDING_AUTHENTICATIONS)
+            .unwrap_or(false)
+    }
+
+    fn try_admit(&self, ip: IpAddr) -> Result<PreAuthPermit, ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        let count = state.per_ip.get(&ip).copied().unwrap_or(0);
+        if state.total >= MAX_PENDING_AUTHENTICATIONS || count >= MAX_PENDING_AUTHENTICATIONS_PER_IP
+        {
+            return Err(());
+        }
+        state.total += 1;
+        state.per_ip.insert(ip, count + 1);
+        Ok(PreAuthPermit {
+            state: Arc::clone(&self.state),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn counts(&self, ip: IpAddr) -> (usize, usize) {
+        self.state
+            .lock()
+            .map(|state| (state.total, state.per_ip.get(&ip).copied().unwrap_or(0)))
+            .unwrap_or_default()
+    }
+}
+
+struct PreAuthPermit {
+    state: Arc<Mutex<PreAuthAdmissionState>>,
+    ip: IpAddr,
+}
+
+impl Drop for PreAuthPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.total = state.total.saturating_sub(1);
+            if let Some(count) = state.per_ip.get_mut(&self.ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.per_ip.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
+struct AuthenticationTaskResult {
+    result: Result<zuicity_transport::AuthenticatedConnection, ServerError>,
+    _permit: PreAuthPermit,
+}
+
+async fn abort_and_drain_authentication_tasks(
+    tasks: &mut tokio::task::JoinSet<AuthenticationTaskResult>,
+) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn authenticate_incoming_connection(
+    incoming: zuicity_transport::JuicityIncomingConnection,
+    users: Arc<Vec<(uuid::Uuid, String)>>,
+    permit: PreAuthPermit,
+) -> AuthenticationTaskResult {
+    authenticate_incoming_connection_with_timeout(incoming, users, permit, AUTHENTICATION_TIMEOUT)
+        .await
+}
+
+async fn authenticate_incoming_connection_with_timeout(
+    incoming: zuicity_transport::JuicityIncomingConnection,
+    users: Arc<Vec<(uuid::Uuid, String)>>,
+    permit: PreAuthPermit,
+    timeout: Duration,
+) -> AuthenticationTaskResult {
+    let result = incoming
+        .authenticate_with_timeout(
+            timeout,
             users
                 .iter()
                 .map(|(uuid, password)| (*uuid, password.as_bytes())),
         )
         .await
         .map_err(ServerError::from);
-    if let Err(error) = &accepted {
-        trace_authenticated_accept_error(error);
+    AuthenticationTaskResult {
+        result,
+        _permit: permit,
     }
-    accepted
+}
+
+fn is_fatal_accept_error(error: &ServerError) -> bool {
+    matches!(
+        error,
+        ServerError::NoUsersConfigured
+            | ServerError::Transport(zuicity_transport::TransportError::EndpointClosed)
+    )
+}
+
+fn is_ignorable_pre_auth_error(error: &ServerError) -> bool {
+    match error {
+        ServerError::Transport(error) => proxy_connection_closed(error),
+        _ => false,
+    }
 }
 
 impl ServerProxyLoopReport {
@@ -909,8 +1172,9 @@ async fn drain_proxy_relays(
     hooks: &ServerRuntimeHooks,
     drain_timeout: Duration,
 ) -> Result<(), ServerError> {
+    let deadline = tokio::time::Instant::now() + drain_timeout;
     loop {
-        match tokio::time::timeout(drain_timeout, relays.join_next()).await {
+        match tokio::time::timeout_at(deadline, relays.join_next()).await {
             Ok(Some(relay)) => record_proxy_connection_result(report, hooks, relay?),
             Ok(None) => return Ok(()),
             Err(_) => break,
@@ -955,6 +1219,9 @@ fn trace_authenticated_accept_error(error: &ServerError) {
     match error {
         ServerError::Transport(zuicity_transport::TransportError::AuthenticationRejected) => {
             tracing::warn!(error = "authentication failed", "handleAuth");
+        }
+        ServerError::Transport(zuicity_transport::TransportError::AuthenticationTimedOut) => {
+            tracing::warn!(error = "authentication timed out", "handleAuth");
         }
         ServerError::Transport(error) => {
             tracing::warn!(error = %error, "handleAuth");
@@ -1093,6 +1360,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pre_auth_admission_enforces_per_ip_and_global_limits_and_releases_permits() {
+        let admission = PreAuthAdmission::new();
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mut permits = (0..MAX_PENDING_AUTHENTICATIONS_PER_IP)
+            .map(|_| admission.try_admit(first_ip).expect("admit first source"))
+            .collect::<Vec<_>>();
+
+        assert!(admission.try_admit(first_ip).is_err());
+        assert_eq!(
+            admission.counts(first_ip),
+            (
+                MAX_PENDING_AUTHENTICATIONS_PER_IP,
+                MAX_PENDING_AUTHENTICATIONS_PER_IP
+            )
+        );
+
+        for host in 1..=(MAX_PENDING_AUTHENTICATIONS - MAX_PENDING_AUTHENTICATIONS_PER_IP) {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, host as u8));
+            permits.push(admission.try_admit(ip).expect("admit distinct source"));
+        }
+        assert!(!admission.has_global_capacity());
+        assert!(
+            admission
+                .try_admit(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
+                .is_err()
+        );
+
+        permits.pop();
+        assert!(admission.has_global_capacity());
+        assert!(
+            admission
+                .try_admit(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn completed_authentication_result_retains_permit_until_consumed() {
+        let admission = PreAuthAdmission::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let permit = admission.try_admit(ip).expect("admit source");
+        let completed = AuthenticationTaskResult {
+            result: Err(ServerError::NoUsersConfigured),
+            _permit: permit,
+        };
+
+        assert_eq!(admission.counts(ip), (1, 1));
+        drop(completed);
+        assert_eq!(admission.counts(ip), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn authentication_timeout_releases_admission_permit_when_result_is_consumed()
+    -> Result<(), ServerError> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "authentication timeout password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
+            .expect("generate fixture cert");
+        let server = JuicityQuicServer::bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = server.local_addr()?;
+        let admission = PreAuthAdmission::new();
+        let server_admission = admission.clone();
+        let users = Arc::new(vec![(uuid, password.to_owned())]);
+        let server_side = async move {
+            let incoming = server.accept_incoming().await?;
+            let ip = incoming.remote_address().ip();
+            let permit = server_admission
+                .try_admit(ip)
+                .expect("admit timeout fixture");
+            Ok::<_, ServerError>(
+                authenticate_incoming_connection_with_timeout(
+                    incoming,
+                    users,
+                    permit,
+                    Duration::from_millis(50),
+                )
+                .await,
+            )
+        };
+
+        let mut endpoint = quinn::Endpoint::client(([127, 0, 0, 1], 0).into())
+            .map_err(zuicity_transport::TransportError::from)?;
+        let config =
+            zuicity_transport::build_client_config_with_roots(cert.cert.pem().as_bytes(), false)?;
+        endpoint.set_default_client_config(config.inner);
+        let connecting = endpoint
+            .connect(server_addr, "server.local")
+            .map_err(zuicity_transport::TransportError::from)?;
+        let (completed, connection) = tokio::join!(server_side, connecting);
+        let completed = completed?;
+        let connection = connection.map_err(zuicity_transport::TransportError::from)?;
+        let ip = connection
+            .local_ip()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        assert!(matches!(
+            completed.result,
+            Err(ServerError::Transport(
+                zuicity_transport::TransportError::AuthenticationTimedOut
+            ))
+        ));
+        assert_eq!(admission.counts(ip), (1, 1));
+        drop(completed);
+        assert_eq!(admission.counts(ip), (0, 0));
+        drop(connection);
+        endpoint.close(0u32.into(), b"test complete");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn server_runtime_proxy_loop_exports_live_metrics_hooks() -> Result<(), ServerError> {
         let uuid = uuid::Uuid::new_v4();
@@ -1194,6 +1575,146 @@ mod tests {
         assert_eq!(report.bytes_from_client, snapshot.bytes_from_client);
         assert_eq!(report.bytes_from_target, snapshot.bytes_from_target);
         echo.shutdown().await.expect("shutdown TCP echo fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_pre_auth_connection_does_not_block_valid_client() -> Result<(), ServerError> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "pre-auth head-of-line password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
+            .expect("generate fixture cert");
+        let mut runtime_config = server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","users":{{"{uuid}":"{password}"}}}}"#
+        ))?;
+        runtime_config.quic.max_idle_timeout_millis = Some(2_000);
+        let runtime = ServerRuntime::new(runtime_config);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            bound
+                .run_proxy_loop_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut silent_endpoint = quinn::Endpoint::client(([127, 0, 0, 1], 0).into())
+            .map_err(zuicity_transport::TransportError::from)?;
+        let silent_config =
+            zuicity_transport::build_client_config_with_roots(cert.cert.pem().as_bytes(), false)?;
+        silent_endpoint.set_default_client_config(silent_config.inner);
+        let silent_connection = silent_endpoint
+            .connect(server_addr, "server.local")
+            .map_err(zuicity_transport::TransportError::from)?
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+
+        let good_client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let cert_pem = cert.cert.pem();
+        let good_connection = tokio::time::timeout(
+            Duration::from_secs(1),
+            good_client.connect_with_roots(
+                server_addr,
+                "server.local",
+                cert_pem.as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            ),
+        )
+        .await
+        .expect("valid client was blocked by a silent pre-auth connection")?;
+
+        drop(good_connection);
+        drop(silent_connection);
+        silent_endpoint.close(0u32.into(), b"test complete");
+        shutdown_tx.send(()).expect("send shutdown");
+        server_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_auth_stream_does_not_terminate_proxy_loop() -> Result<(), ServerError> {
+        let uuid = uuid::Uuid::new_v4();
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])
+            .expect("generate fixture cert");
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","users":{{"{uuid}":"password"}}}}"#
+        ))?);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let metrics = ServerMetrics::default();
+        let hooks = ServerRuntimeHooks::new(metrics.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            bound
+                .run_proxy_loop_until_with_hooks(
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    hooks,
+                )
+                .await
+        });
+
+        let mut endpoint = quinn::Endpoint::client(([127, 0, 0, 1], 0).into())
+            .map_err(zuicity_transport::TransportError::from)?;
+        let config =
+            zuicity_transport::build_client_config_with_roots(cert.cert.pem().as_bytes(), false)?;
+        endpoint.set_default_client_config(config.inner);
+        let connection = endpoint
+            .connect(server_addr, "server.local")
+            .map_err(zuicity_transport::TransportError::from)?
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        let mut auth = connection
+            .open_uni()
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        auth.write_all(&[zuicity_protocol::VERSION_0])
+            .await
+            .map_err(zuicity_transport::TransportError::from)?;
+        auth.finish()
+            .map_err(zuicity_transport::TransportError::from)?;
+
+        wait_for_server_metrics(&metrics, |snapshot| snapshot.rejected_connections == 1).await;
+        let good_client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let cert_pem = cert.cert.pem();
+        let good_connection = tokio::time::timeout(
+            Duration::from_secs(1),
+            good_client.connect_with_roots(
+                server_addr,
+                "server.local",
+                cert_pem.as_bytes(),
+                false,
+                uuid,
+                b"password",
+            ),
+        )
+        .await
+        .expect("valid client timed out after partial auth stream")?;
+        wait_for_server_metrics(&metrics, |snapshot| snapshot.accepted_connections == 1).await;
+        drop(good_connection);
+        wait_for_server_metrics(&metrics, |snapshot| {
+            snapshot.accepted_connections == 1 && snapshot.active_connections == 0
+        })
+        .await;
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let report = server_task.await??;
+        assert_eq!(report.accepted_connections, 1);
+        assert_eq!(report.rejected_connections, 1);
+        endpoint.close(0u32.into(), b"test complete");
         Ok(())
     }
 

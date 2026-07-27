@@ -267,7 +267,11 @@ async fn udp_relay_echoes_datagram() -> anyhow::Result<()> {
     let fixture = LiveServerFixture::start()?;
     let client_fixture = fixture.client.clone();
     let bound = fixture.bound;
-    let server_task = tokio::spawn(async move { bound.accept_one_udp_over_stream().await });
+    let server_task = tokio::spawn(async move {
+        bound
+            .accept_one_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+            .await
+    });
     let connection = connect_client(&client_fixture).await?;
     let echo_addr = echo.local_addr();
     let mut stream = connection

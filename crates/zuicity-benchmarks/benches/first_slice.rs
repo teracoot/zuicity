@@ -128,7 +128,11 @@ fn live_benches(c: &mut Criterion) {
             let fixture = LiveServerFixture::start().expect("start server fixture");
             let client_fixture = fixture.client.clone();
             let bound = fixture.bound;
-            let server_task = tokio::spawn(async move { bound.accept_one_udp_over_stream().await });
+            let server_task = tokio::spawn(async move {
+                bound
+                    .accept_one_udp_over_stream_with_idle_timeout(Duration::from_millis(100))
+                    .await
+            });
             let connection = connect_client(&client_fixture)
                 .await
                 .expect("connect client");

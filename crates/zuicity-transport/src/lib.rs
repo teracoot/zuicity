@@ -49,6 +49,18 @@ mod udp_endpoint;
 mod udp_gro;
 mod udp_gso;
 mod udp_modes;
+#[cfg(target_os = "linux")]
+mod udp_plain_batch;
+#[cfg(target_os = "linux")]
+mod udp_plain_direct;
+#[cfg(all(test, target_os = "linux"))]
+mod udp_plain_integration_tests;
+#[cfg(target_os = "linux")]
+mod udp_plain_syscall;
+#[cfg(all(test, target_os = "linux"))]
+mod udp_plain_test_support;
+#[cfg(all(test, target_os = "linux"))]
+mod udp_send_ownership_tests;
 mod udp_socket_buffers;
 mod udp_state;
 mod vless_dialer;
@@ -92,13 +104,52 @@ pub use udp_modes::{GroMode, GsoMode};
 use udp_socket_buffers::configure_socket_buffers;
 #[cfg(test)]
 use udp_state::GsoTestHook;
+#[cfg(target_os = "linux")]
+use udp_state::PlainSendCounters;
 use udp_state::{GroCounters, GroReceiver, GsoCounters, GsoDestState};
 pub use vless_dialer::VlessDialerLink;
 pub use vmess_dialer::VmessDialerLink;
 
+/// Maximum handshakes/authentication attempts retained by a server loop.
+///
+/// The same value also bounds Quinn's queue of connection attempts that the
+/// application has not accepted yet.
+pub const MAX_PENDING_SERVER_AUTHENTICATIONS: usize = 128;
+
+/// Aggregate stream bytes an unauthenticated peer may hold in Quinn receive
+/// buffers. Authenticated connections are raised to their configured policy.
+pub const PRE_AUTHENTICATION_RECEIVE_WINDOW: u64 = 64 * 1024;
+
+const MAX_UNACCEPTED_CONNECTION_BUFFER: u64 = 16 * 1024;
+const MAX_UNACCEPTED_CONNECTION_BUFFER_TOTAL: u64 =
+    MAX_PENDING_SERVER_AUTHENTICATIONS as u64 * MAX_UNACCEPTED_CONNECTION_BUFFER;
+
 /// Per-direction relay copy buffer. Larger than tokio::io::copy's 8 KiB default
 /// so bulk transfers hand the QUIC stack and the kernel socket large write
 /// batches, cutting syscall and stream-frame overhead on high-throughput flows.
+#[cfg(test)]
+#[derive(Clone)]
+struct PlainUdpTestConfig {
+    gso_mode: GsoMode,
+    gro_mode: GroMode,
+    gso_hook: GsoTestHook,
+    #[cfg(target_os = "linux")]
+    plain_hook: Option<udp_plain_test_support::PlainSendTestHook>,
+}
+
+#[cfg(test)]
+impl PlainUdpTestConfig {
+    fn new(gso_mode: GsoMode, gro_mode: GroMode) -> Self {
+        Self {
+            gso_mode,
+            gro_mode,
+            gso_hook: GsoTestHook::None,
+            #[cfg(target_os = "linux")]
+            plain_hook: None,
+        }
+    }
+}
+
 const RELAY_COPY_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Upstream TUIC command-frame version used by daeuniverse/outbound.
@@ -397,7 +448,7 @@ fn dialer_link_query_u64(
 /// is dropped. In [`GsoMode::Off`] every transmit is sent one datagram per
 /// segment, matching the historical safe behaviour and upstream Go quic-go.
 struct PlainUdpSocket {
-    io: tokio::net::UdpSocket,
+    io: Arc<tokio::net::UdpSocket>,
     /// GSO mode for this socket.
     mode: GsoMode,
     /// GRO mode for this socket's receive path.
@@ -417,6 +468,10 @@ struct PlainUdpSocket {
     counters: Arc<GsoCounters>,
     /// Receive-path GRO counters, shareable with tests.
     gro_counters: Arc<GroCounters>,
+    #[cfg(target_os = "linux")]
+    plain_batch_io: udp_plain_syscall::PlainBatchIo,
+    #[cfg(target_os = "linux")]
+    plain_counters: Arc<PlainSendCounters>,
     /// Shared sender used only to emit the per-message `UDP_SEGMENT` cmsg via
     /// `sendmsg` on this socket's fd. Built from a throwaway socket so it never
     /// mutates the receive options of the real socket. Linux-only.
@@ -438,6 +493,10 @@ impl fmt::Debug for PlainUdpSocket {
 }
 
 impl PlainUdpSocket {
+    #[cfg(all(test, target_os = "linux"))]
+    fn plain_counters(&self) -> Arc<PlainSendCounters> {
+        Arc::clone(&self.plain_counters)
+    }
     /// Builds a socket using the production GSO mode resolved from the
     /// environment ([`GsoMode::from_env`]).
     fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
@@ -446,6 +505,11 @@ impl PlainUdpSocket {
         let (io, gro_recv) = Self::prepare_io(socket, gro_mode)?;
         #[cfg(target_os = "linux")]
         let gso_sender = Self::build_sender_for(mode);
+        let io = Arc::new(io);
+        #[cfg(target_os = "linux")]
+        let plain_counters = Arc::new(PlainSendCounters::default());
+        #[cfg(target_os = "linux")]
+        let plain_batch_io = udp_plain_syscall::PlainBatchIo::new(Arc::clone(&io));
         Ok(Self {
             io,
             mode,
@@ -454,6 +518,10 @@ impl PlainUdpSocket {
             gso_state: Mutex::new(HashMap::new()),
             counters: Arc::new(GsoCounters::default()),
             gro_counters: Arc::new(GroCounters::default()),
+            #[cfg(target_os = "linux")]
+            plain_batch_io,
+            #[cfg(target_os = "linux")]
+            plain_counters,
             #[cfg(target_os = "linux")]
             gso_sender,
             #[cfg(test)]
@@ -481,20 +549,49 @@ impl PlainUdpSocket {
         gro_mode: GroMode,
         test_hook: GsoTestHook,
     ) -> std::io::Result<Self> {
-        let (io, gro_recv) = Self::prepare_io(socket, gro_mode)?;
+        Self::with_test_config(
+            socket,
+            PlainUdpTestConfig {
+                gso_mode: mode,
+                gro_mode,
+                gso_hook: test_hook,
+                #[cfg(target_os = "linux")]
+                plain_hook: None,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_config(
+        socket: std::net::UdpSocket,
+        config: PlainUdpTestConfig,
+    ) -> std::io::Result<Self> {
+        let (io, gro_recv) = Self::prepare_io(socket, config.gro_mode)?;
         #[cfg(target_os = "linux")]
-        let gso_sender = Self::build_sender_for(mode);
+        let gso_sender = Self::build_sender_for(config.gso_mode);
+        let io = Arc::new(io);
+        #[cfg(target_os = "linux")]
+        let plain_counters = Arc::new(PlainSendCounters::default());
+        #[cfg(target_os = "linux")]
+        let plain_batch_io = config.plain_hook.map_or_else(
+            || udp_plain_syscall::PlainBatchIo::new(Arc::clone(&io)),
+            |hook| udp_plain_syscall::PlainBatchIo::with_hook(Arc::clone(&io), hook),
+        );
         Ok(Self {
             io,
-            mode,
-            gro_mode,
+            mode: config.gso_mode,
+            gro_mode: config.gro_mode,
             gro_recv,
             gso_state: Mutex::new(HashMap::new()),
             counters: Arc::new(GsoCounters::default()),
             gro_counters: Arc::new(GroCounters::default()),
             #[cfg(target_os = "linux")]
+            plain_batch_io,
+            #[cfg(target_os = "linux")]
+            plain_counters,
+            #[cfg(target_os = "linux")]
             gso_sender,
-            test_hook,
+            test_hook: config.gso_hook,
         })
     }
 
@@ -713,6 +810,48 @@ impl quinn::UdpPoller for PlainUdpPoller {
 #[derive(Debug, Clone)]
 pub struct JuicityQuicServer {
     endpoint: quinn::Endpoint,
+    authenticated_policy: AuthenticatedConnectionPolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AuthenticatedConnectionPolicy {
+    receive_window: quinn::VarInt,
+    send_window: u64,
+    max_bidi_streams: quinn::VarInt,
+    max_uni_streams: quinn::VarInt,
+}
+
+impl AuthenticatedConnectionPolicy {
+    fn from_runtime_policy(policy: &QuicRuntimePolicy) -> Self {
+        Self {
+            receive_window: quinn::VarInt::from_u32(policy.receive_windows.max_connection as u32),
+            send_window: policy.receive_windows.max_connection,
+            max_bidi_streams: quinn::VarInt::from_u32(policy.streams.max_incoming_streams as u32),
+            max_uni_streams: quinn::VarInt::from_u32(
+                policy.streams.max_incoming_uni_streams as u32,
+            ),
+        }
+    }
+
+    fn apply(self, connection: &quinn::Connection) {
+        connection.set_receive_window(self.receive_window);
+        connection.set_send_window(self.send_window);
+        connection.set_max_concurrent_bi_streams(self.max_bidi_streams);
+        connection.set_max_concurrent_uni_streams(self.max_uni_streams);
+    }
+}
+
+fn pre_authentication_server_policy(policy: &QuicRuntimePolicy) -> QuicRuntimePolicy {
+    let mut pre_auth = policy.clone();
+    pre_auth.receive_windows.max_connection = PRE_AUTHENTICATION_RECEIVE_WINDOW;
+    // The official Go client starts authentication in a goroutine, then uses
+    // nonblocking OpenStream immediately. Advertising zero bidirectional
+    // streams makes that client tear down an otherwise valid connection before
+    // the server can authenticate it. One queued stream preserves interop while
+    // the small pre-auth receive window and admission limits keep it bounded.
+    pre_auth.streams.max_incoming_streams = 1;
+    pre_auth.streams.max_incoming_uni_streams = 1;
+    pre_auth
 }
 
 impl JuicityQuicServer {
@@ -737,9 +876,20 @@ impl JuicityQuicServer {
         key_pem: &[u8],
         policy: &QuicRuntimePolicy,
     ) -> Result<Self, TransportError> {
-        let config = build_server_config_from_pem_with_policy(cert_pem, key_pem, policy)?;
+        let authenticated_policy = AuthenticatedConnectionPolicy::from_runtime_policy(policy);
+        let pre_auth_policy = pre_authentication_server_policy(policy);
+        let mut config =
+            build_server_config_from_pem_with_policy(cert_pem, key_pem, &pre_auth_policy)?;
+        config
+            .inner
+            .max_incoming(MAX_PENDING_SERVER_AUTHENTICATIONS)
+            .incoming_buffer_size(MAX_UNACCEPTED_CONNECTION_BUFFER)
+            .incoming_buffer_size_total(MAX_UNACCEPTED_CONNECTION_BUFFER_TOTAL);
         let endpoint = build_ecn_safe_endpoint(addr, Some(config.inner))?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            authenticated_policy,
+        })
     }
 
     /// Returns the local UDP socket address.
@@ -761,17 +911,69 @@ impl JuicityQuicServer {
         &self,
         credentials: impl IntoIterator<Item = (uuid::Uuid, &'a [u8])>,
     ) -> Result<AuthenticatedConnection, TransportError> {
+        self.accept_incoming()
+            .await?
+            .authenticate_with(credentials)
+            .await
+    }
+
+    /// Accepts one endpoint admission without waiting for its handshake or authentication.
+    pub async fn accept_incoming(&self) -> Result<JuicityIncomingConnection, TransportError> {
         let incoming = self
             .endpoint
             .accept()
             .await
             .ok_or(TransportError::EndpointClosed)?;
-        let connection = incoming.accept()?.await?;
+        Ok(JuicityIncomingConnection {
+            incoming,
+            authenticated_policy: self.authenticated_policy,
+        })
+    }
+}
+
+/// An admitted QUIC connection that has not completed its handshake or authentication.
+#[derive(Debug)]
+pub struct JuicityIncomingConnection {
+    incoming: quinn::Incoming,
+    authenticated_policy: AuthenticatedConnectionPolicy,
+}
+
+impl JuicityIncomingConnection {
+    /// Returns the peer UDP address that initiated this admission.
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.incoming.remote_address()
+    }
+
+    /// Rejects this admission without completing the handshake.
+    pub fn refuse(self) {
+        self.incoming.refuse();
+    }
+
+    /// Completes the QUIC handshake and validates the first authentication stream.
+    pub async fn authenticate_with<'a>(
+        self,
+        credentials: impl IntoIterator<Item = (uuid::Uuid, &'a [u8])>,
+    ) -> Result<AuthenticatedConnection, TransportError> {
+        let connection = self.incoming.accept()?.await?;
         let protocol = verify_authentication_stream_with(&connection, credentials).await?;
+        self.authenticated_policy.apply(&connection);
         Ok(AuthenticatedConnection {
             connection,
             protocol,
         })
+    }
+
+    /// Completes handshake and authentication within an application deadline.
+    pub async fn authenticate_with_timeout<'a>(
+        self,
+        timeout: Duration,
+        credentials: impl IntoIterator<Item = (uuid::Uuid, &'a [u8])>,
+    ) -> Result<AuthenticatedConnection, TransportError> {
+        match tokio::time::timeout(timeout, self.authenticate_with(credentials)).await {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::AuthenticationTimedOut),
+        }
     }
 }
 
@@ -6584,7 +6786,7 @@ async fn verify_authentication_stream_with<'a>(
     connection: &quinn::Connection,
     credentials: impl IntoIterator<Item = (uuid::Uuid, &'a [u8])>,
 ) -> Result<ProxyProtocol, TransportError> {
-    let payload = loop {
+    let (payload, mut authentication_stream) = loop {
         let mut stream = connection.accept_uni().await?;
         let mut head = [0u8; 2];
         stream.read_exact(&mut head).await?;
@@ -6599,7 +6801,7 @@ async fn verify_authentication_stream_with<'a>(
         stream
             .read_exact(&mut payload[2..AUTHENTICATION_FRAME_LEN])
             .await?;
-        break payload;
+        break (payload, stream);
     };
 
     let parsed = match payload[0] {
@@ -6636,6 +6838,21 @@ async fn verify_authentication_stream_with<'a>(
             let expected_token =
                 export_connection_authentication_token(connection, uuid, password)?;
             if request_token == expected_token {
+                if protocol == ProxyProtocol::Juicity {
+                    // The official Go client keeps this stream open for the
+                    // connection lifetime and may append underlay-auth records.
+                    // Dropping it here sends STOP_SENDING; the Go client treats
+                    // that as fatal and closes the entire QUIC connection.
+                    tokio::spawn(async move {
+                        let mut buffer = [0_u8; 1024];
+                        loop {
+                            match authentication_stream.read(&mut buffer).await {
+                                Ok(None) | Err(_) => break,
+                                Ok(Some(_)) => {}
+                            }
+                        }
+                    });
+                }
                 return Ok(protocol);
             }
             break;
@@ -6665,6 +6882,40 @@ fn export_connection_authentication_token(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn server_pre_authentication_policy_is_bounded_and_restorable() {
+        let authenticated = QuicRuntimePolicy::upstream_server();
+        let pre_auth = pre_authentication_server_policy(&authenticated);
+        let restored = AuthenticatedConnectionPolicy::from_runtime_policy(&authenticated);
+
+        assert_eq!(
+            pre_auth.receive_windows.max_connection,
+            PRE_AUTHENTICATION_RECEIVE_WINDOW
+        );
+        assert_eq!(
+            pre_auth.receive_windows.max_stream,
+            authenticated.receive_windows.max_stream
+        );
+        assert_eq!(pre_auth.streams.max_incoming_streams, 1);
+        assert_eq!(pre_auth.streams.max_incoming_uni_streams, 1);
+        assert_eq!(
+            restored.receive_window,
+            quinn::VarInt::from_u32(authenticated.receive_windows.max_connection as u32)
+        );
+        assert_eq!(
+            restored.send_window,
+            authenticated.receive_windows.max_connection
+        );
+        assert_eq!(
+            restored.max_bidi_streams,
+            quinn::VarInt::from_u32(authenticated.streams.max_incoming_streams as u32)
+        );
+        assert_eq!(
+            restored.max_uni_streams,
+            quinn::VarInt::from_u32(authenticated.streams.max_incoming_uni_streams as u32)
+        );
+    }
 
     #[test]
     fn upstream_client_policy_matches_upstream_runtime_values() {
@@ -6718,6 +6969,21 @@ mod tests {
             GsoMode::from_env_values(Some("true"), Some("1")),
             GsoMode::Off
         );
+    }
+
+    #[test]
+    fn given_gso_off_when_linux_capabilities_are_queried_then_quinn_grouping_is_ten() {
+        let transport = build_transport_config(&QuicRuntimePolicy::upstream_client());
+
+        if cfg!(target_os = "linux") {
+            assert_eq!(GsoMode::Off.max_transmit_segments(), 10);
+            assert_eq!(GsoMode::Auto.max_transmit_segments(), 10);
+            assert!(transport.segmentation_offload_enabled());
+        } else {
+            assert_eq!(GsoMode::Off.max_transmit_segments(), 1);
+            assert_eq!(GsoMode::Auto.max_transmit_segments(), 1);
+            assert!(!transport.segmentation_offload_enabled());
+        }
     }
 
     #[test]
@@ -7262,16 +7528,17 @@ mod tests {
     )> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .map_err(std::io::Error::other)?;
-        let server = JuicityQuicServer::bind_with_pem(
+        let endpoint = quinn::Endpoint::server(
+            hysteria2_quic_test_server_config(
+                cert.cert.pem().as_bytes(),
+                cert.key_pair.serialize_pem().as_bytes(),
+            )?,
             SocketAddr::from(([127, 0, 0, 1], 0)),
-            cert.cert.pem().as_bytes(),
-            cert.key_pair.serialize_pem().as_bytes(),
-        )
-        .map_err(std::io::Error::other)?;
-        let local_addr = server.local_addr().map_err(std::io::Error::other)?;
+        )?;
+        let local_addr = endpoint.local_addr()?;
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
-            let incoming = server.endpoint.accept().await.ok_or_else(|| {
+            let incoming = endpoint.accept().await.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "closed Hysteria2 endpoint",

@@ -204,6 +204,8 @@ impl QuicRuntimePolicy {
 pub struct BuiltTransportConfig {
     pub(crate) inner: quinn::TransportConfig,
     pub(crate) policy: QuicRuntimePolicy,
+    #[cfg(test)]
+    pub(crate) segmentation_offload_enabled: bool,
 }
 
 impl BuiltTransportConfig {
@@ -263,6 +265,13 @@ impl BuiltTransportConfig {
         } else {
             None
         }
+    }
+
+    /// Returns whether Quinn may construct grouped UDP transmits.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn segmentation_offload_enabled(&self) -> bool {
+        self.segmentation_offload_enabled
     }
 
     /// Converts into a shareable Quinn transport config.

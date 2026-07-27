@@ -53,6 +53,9 @@ pub enum TransportError {
     /// Authentication failed.
     #[error("authentication rejected")]
     AuthenticationRejected,
+    /// Authentication did not complete before the application deadline.
+    #[error("authentication timed out")]
+    AuthenticationTimedOut,
     /// Peer closed a proxy stream before sending the first header byte.
     #[error("proxy stream closed before header")]
     ProxyStreamClosedBeforeHeader,

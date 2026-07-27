@@ -34,6 +34,13 @@ pub(crate) struct GsoCounters {
     pub(crate) long_header_gso_attempt: AtomicCounter64,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PlainSendCounters {
+    pub(crate) sendmmsg_calls: AtomicCounter64,
+    pub(crate) sendmmsg_datagrams: AtomicCounter64,
+    pub(crate) partial_prefixes: AtomicCounter64,
+}
+
 /// Counters for the GRO receive path. Exposed as atomics so tests can assert
 /// that coalescing actually engaged without scraping logs.
 #[derive(Debug, Default)]

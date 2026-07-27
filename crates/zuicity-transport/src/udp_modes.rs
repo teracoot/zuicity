@@ -7,20 +7,16 @@ pub enum GsoMode {
     Off,
     /// Attempt GSO on eligible short-header batched transmits, with per-message
     /// `UDP_SEGMENT` cmsg and same-call fallback to plain datagrams on the first
-    /// `EINVAL`/`EIO` from a destination. Enabled only when the environment
-    /// opts in on Linux.
+    /// `EINVAL`/`EIO` from a destination. Enabled only by explicit opt-in on
+    /// Linux.
     Auto,
 }
 
 impl GsoMode {
-    /// Linux caps a single `UDP_SEGMENT` transmit at 64 datagrams
-    /// (`UDP_MAX_SEGMENTS = 1 << 6`).
-    const MAX_GSO_SEGMENTS: usize = 64;
-
     /// Resolves the production GSO mode from the environment. GSO is opt-in:
     /// `ZUICITY_ENABLE_GSO=1` (or `true`) enables [`GsoMode::Auto`], while
-    /// unset or `ZUICITY_DISABLE_GSO=1` keeps [`GsoMode::Off`]. On non-Linux
-    /// targets GSO is always [`GsoMode::Off`].
+    /// unset, invalid, or `ZUICITY_DISABLE_GSO=1` keeps [`GsoMode::Off`]. On
+    /// non-Linux targets GSO is always [`GsoMode::Off`].
     #[must_use]
     pub fn from_env() -> Self {
         let enable = std::env::var("ZUICITY_ENABLE_GSO").ok();
@@ -40,10 +36,17 @@ impl GsoMode {
     }
 
     /// Maximum number of datagrams quinn may pack into one [`quinn::udp::Transmit`].
+    #[cfg(target_os = "linux")]
     pub(crate) const fn max_transmit_segments(self) -> usize {
         match self {
-            Self::Off => 1,
-            Self::Auto => Self::MAX_GSO_SEGMENTS,
+            Self::Off | Self::Auto => crate::udp_plain_batch::MAX_PLAIN_BATCH_DATAGRAMS,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const fn max_transmit_segments(self) -> usize {
+        match self {
+            Self::Off | Self::Auto => 1,
         }
     }
 }
