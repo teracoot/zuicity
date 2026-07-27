@@ -2,6 +2,13 @@ use std::{io, net::SocketAddr};
 
 use super::*;
 
+#[test]
+fn fixed_capacity_covers_role_specific_production_batches() {
+    assert_eq!(CLIENT_PLAIN_BATCH_DATAGRAMS, 88);
+    assert_eq!(SERVER_PLAIN_BATCH_DATAGRAMS, 96);
+    assert_eq!(MAX_PLAIN_BATCH_DATAGRAMS, 128);
+}
+
 fn owned_transmit(
     destination: SocketAddr,
     contents: &[u8],
@@ -41,12 +48,12 @@ fn given_reserved_owned_batch_when_prefix_commits_then_suffix_reuses_reserved_st
 -> io::Result<()> {
     let destination = SocketAddr::from(([127, 0, 0, 1], 9008));
     let mut progress = BatchProgress::new(owned_transmit(destination, b"aaaabbbbcccc", 4)?);
-    let capacity = progress.transmit().storage_capacity();
+    let capacity = progress.storage_capacity();
 
     progress.commit_prefix(2)?;
 
     assert_eq!(progress.transmit().contents, b"cccc");
-    assert_eq!(progress.transmit().storage_capacity(), capacity);
+    assert_eq!(progress.storage_capacity(), capacity);
     Ok(())
 }
 
@@ -83,7 +90,7 @@ fn given_non_multiple_payload_when_lengths_read_then_final_datagram_is_short() -
     let destination = SocketAddr::from(([127, 0, 0, 1], 9003));
     let transmit = owned_transmit(destination, b"aaaabbbbcc", 4)?;
 
-    let lengths = transmit.datagram_lengths().collect::<Vec<_>>();
+    let lengths = transmit.transmit().datagram_lengths().collect::<Vec<_>>();
 
     assert_eq!(lengths, [4, 4, 2]);
     Ok(())

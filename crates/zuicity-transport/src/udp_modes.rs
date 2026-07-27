@@ -13,6 +13,10 @@ pub enum GsoMode {
 }
 
 impl GsoMode {
+    /// Keeps the aggregate `UDP_SEGMENT` message below the IPv4 UDP size limit
+    /// at supported QUIC MTUs; Linux's 64-segment count limit alone is too high.
+    const MAX_GSO_SEGMENTS: usize = 44;
+
     /// Resolves the production GSO mode from the environment. GSO is opt-in:
     /// `ZUICITY_ENABLE_GSO=1` (or `true`) enables [`GsoMode::Auto`], while
     /// unset, invalid, or `ZUICITY_DISABLE_GSO=1` keeps [`GsoMode::Off`]. On
@@ -35,20 +39,45 @@ impl GsoMode {
         }
     }
 
-    /// Maximum number of datagrams quinn may pack into one [`quinn::udp::Transmit`].
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn max_transmit_segments(self) -> usize {
+    pub(crate) const fn max_transmit_segments(self, plain_batch_segments: usize) -> usize {
         match self {
-            Self::Off | Self::Auto => crate::udp_plain_batch::MAX_PLAIN_BATCH_DATAGRAMS,
+            Self::Off => plain_batch_segments,
+            Self::Auto if plain_batch_segments > Self::MAX_GSO_SEGMENTS => Self::MAX_GSO_SEGMENTS,
+            Self::Auto => plain_batch_segments,
         }
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) const fn max_transmit_segments(self) -> usize {
-        match self {
-            Self::Off | Self::Auto => 1,
-        }
+pub(crate) fn plain_batch_segments_from_env(default_segments: usize) -> usize {
+    let value = std::env::var("ZUICITY_PLAIN_BATCH_SEGMENTS").ok();
+    plain_batch_segments_from_value(value.as_deref(), default_segments)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn plain_batch_segments_from_value(
+    value: Option<&str>,
+    default_segments: usize,
+) -> usize {
+    match value.map(str::trim) {
+        Some("20") => 20,
+        Some("32") => 32,
+        Some("64") => 64,
+        Some("80") => 80,
+        Some("88") => 88,
+        Some("96") => 96,
+        Some("104") => 104,
+        Some("112") => 112,
+        Some("128") => 128,
+        Some(_) | None => default_segments,
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn plain_batch_segments_from_value(
+    _value: Option<&str>,
+    _default_segments: usize,
+) -> usize {
+    1
 }
 
 fn env_flag_is_set(value: Option<&str>) -> bool {

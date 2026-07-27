@@ -4,7 +4,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::udp_plain_batch::OwnedTransmit;
+use arrayvec::ArrayVec;
+
+use crate::udp_plain_batch::{MAX_PLAIN_BATCH_DATAGRAMS, PlainTransmit};
 
 #[derive(Clone, Debug)]
 pub(crate) enum ScriptedAttempt {
@@ -50,7 +52,10 @@ impl PlainSendTestHook {
         self
     }
 
-    pub(crate) fn attempt(&self, transmit: &OwnedTransmit) -> io::Result<Vec<usize>> {
+    pub(crate) fn attempt(
+        &self,
+        transmit: PlainTransmit<'_>,
+    ) -> io::Result<ArrayVec<usize, MAX_PLAIN_BATCH_DATAGRAMS>> {
         self.state
             .offered
             .lock()
@@ -64,10 +69,13 @@ impl PlainSendTestHook {
             .pop_front()
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
         match scripted {
-            ScriptedAttempt::Accepted(count) => {
-                Ok(transmit.datagram_lengths().take(count).collect())
-            }
-            ScriptedAttempt::AcceptedLengths(lengths) => Ok(lengths),
+            ScriptedAttempt::Accepted(count) => Ok(transmit
+                .datagram_lengths()
+                .take(count)
+                .collect::<ArrayVec<_, MAX_PLAIN_BATCH_DATAGRAMS>>()),
+            ScriptedAttempt::AcceptedLengths(lengths) => Ok(lengths
+                .into_iter()
+                .collect::<ArrayVec<_, MAX_PLAIN_BATCH_DATAGRAMS>>()),
             ScriptedAttempt::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             ScriptedAttempt::Error(kind) => Err(io::Error::from(kind)),
         }

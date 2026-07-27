@@ -6,6 +6,7 @@ use aes_gcm::{
     aead::{Aead, Payload},
 };
 use base64::{Engine, engine::general_purpose};
+use bytes::Buf;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256};
@@ -150,7 +151,7 @@ impl PlainUdpTestConfig {
     }
 }
 
-const RELAY_COPY_BUFFER_SIZE: usize = 256 * 1024;
+const RELAY_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Upstream TUIC command-frame version used by daeuniverse/outbound.
 const TUIC_VERSION_5: u8 = 0x05;
@@ -451,6 +452,8 @@ struct PlainUdpSocket {
     io: Arc<tokio::net::UdpSocket>,
     /// GSO mode for this socket.
     mode: GsoMode,
+    /// Maximum datagrams Quinn may group into one transmit for this endpoint.
+    plain_batch_segments: usize,
     /// GRO mode for this socket's receive path.
     gro_mode: GroMode,
     /// The GRO receiver, `Some` only when `UDP_GRO` was successfully enabled on
@@ -462,6 +465,9 @@ struct PlainUdpSocket {
     ///
     /// [`poll_recv`]: PlainUdpSocket::poll_recv
     gro_recv: GroReceiver,
+    /// Whether the configured socket may fragment transmitted datagrams.
+    /// Quinn enables MTU discovery only when this is false.
+    may_fragment: bool,
     /// Per-destination learned GSO capability.
     gso_state: Mutex<HashMap<SocketAddr, GsoDestState>>,
     /// Send-path counters, shareable with tests.
@@ -486,8 +492,10 @@ impl fmt::Debug for PlainUdpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlainUdpSocket")
             .field("mode", &self.mode)
+            .field("plain_batch_segments", &self.plain_batch_segments)
             .field("gro_mode", &self.gro_mode)
             .field("gro_active", &self.gro_recv.is_some())
+            .field("may_fragment", &self.may_fragment)
             .finish_non_exhaustive()
     }
 }
@@ -499,10 +507,15 @@ impl PlainUdpSocket {
     }
     /// Builds a socket using the production GSO mode resolved from the
     /// environment ([`GsoMode::from_env`]).
-    fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
+    fn new(
+        socket: std::net::UdpSocket,
+        default_plain_batch_segments: usize,
+    ) -> std::io::Result<Self> {
         let mode = GsoMode::from_env();
         let gro_mode = GroMode::from_env();
-        let (io, gro_recv) = Self::prepare_io(socket, gro_mode)?;
+        let plain_batch_segments =
+            udp_modes::plain_batch_segments_from_env(default_plain_batch_segments);
+        let (io, gro_recv, may_fragment) = Self::prepare_io(socket, gro_mode)?;
         #[cfg(target_os = "linux")]
         let gso_sender = Self::build_sender_for(mode);
         let io = Arc::new(io);
@@ -513,8 +526,10 @@ impl PlainUdpSocket {
         Ok(Self {
             io,
             mode,
+            plain_batch_segments,
             gro_mode,
             gro_recv,
+            may_fragment,
             gso_state: Mutex::new(HashMap::new()),
             counters: Arc::new(GsoCounters::default()),
             gro_counters: Arc::new(GroCounters::default()),
@@ -566,7 +581,7 @@ impl PlainUdpSocket {
         socket: std::net::UdpSocket,
         config: PlainUdpTestConfig,
     ) -> std::io::Result<Self> {
-        let (io, gro_recv) = Self::prepare_io(socket, config.gro_mode)?;
+        let (io, gro_recv, may_fragment) = Self::prepare_io(socket, config.gro_mode)?;
         #[cfg(target_os = "linux")]
         let gso_sender = Self::build_sender_for(config.gso_mode);
         let io = Arc::new(io);
@@ -580,8 +595,13 @@ impl PlainUdpSocket {
         Ok(Self {
             io,
             mode: config.gso_mode,
+            plain_batch_segments: udp_modes::plain_batch_segments_from_value(
+                None,
+                udp_plain_batch::TEST_PLAIN_BATCH_DATAGRAMS,
+            ),
             gro_mode: config.gro_mode,
             gro_recv,
+            may_fragment,
             gso_state: Mutex::new(HashMap::new()),
             counters: Arc::new(GsoCounters::default()),
             gro_counters: Arc::new(GroCounters::default()),
@@ -598,12 +618,12 @@ impl PlainUdpSocket {
     fn prepare_io(
         socket: std::net::UdpSocket,
         gro_mode: GroMode,
-    ) -> std::io::Result<(tokio::net::UdpSocket, GroReceiver)> {
+    ) -> std::io::Result<(tokio::net::UdpSocket, GroReceiver, bool)> {
         socket.set_nonblocking(true)?;
         configure_socket_buffers(&socket);
-        let gro_recv = Self::build_gro_receiver(&socket, gro_mode);
+        let (gro_recv, may_fragment) = Self::build_gro_receiver(&socket, gro_mode);
         let io = tokio::net::UdpSocket::from_std(socket)?;
-        Ok((io, gro_recv))
+        Ok((io, gro_recv, may_fragment))
     }
 
     /// Returns a shared handle to the send-path counters (used by tests).
@@ -775,7 +795,7 @@ impl quinn::AsyncUdpSocket for PlainUdpSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.mode.max_transmit_segments()
+        self.mode.max_transmit_segments(self.plain_batch_segments)
     }
 
     fn max_receive_segments(&self) -> usize {
@@ -788,6 +808,10 @@ impl quinn::AsyncUdpSocket for PlainUdpSocket {
         } else {
             1
         }
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.may_fragment
     }
 }
 
@@ -1432,8 +1456,23 @@ trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 struct TcpProxyTargetStream {
-    inner: Box<dyn AsyncReadWrite>,
+    inner: TcpProxyTargetStreamInner,
     peer_addr: SocketAddr,
+}
+
+enum TcpProxyTargetStreamInner {
+    Plain(tokio::net::TcpStream),
+    Boxed(Box<dyn AsyncReadWrite>),
+}
+
+enum TcpProxyTargetReadHalf {
+    Plain(tokio::net::tcp::OwnedReadHalf),
+    Boxed(tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>),
+}
+
+enum TcpProxyTargetWriteHalf {
+    Plain(tokio::net::tcp::OwnedWriteHalf),
+    Boxed(tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>),
 }
 
 impl TcpProxyTargetStream {
@@ -1442,7 +1481,7 @@ impl TcpProxyTargetStream {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         Self {
-            inner: Box::new(stream),
+            inner: TcpProxyTargetStreamInner::Boxed(Box::new(stream)),
             peer_addr,
         }
     }
@@ -1453,11 +1492,33 @@ impl TcpProxyTargetStream {
         // 64 KiB batches, so coalescing partial segments only adds round-trip
         // delay to the small request/response exchanges the proxy also carries.
         stream.set_nodelay(true)?;
-        Ok(Self::new(stream, peer_addr))
+        Ok(Self {
+            inner: TcpProxyTargetStreamInner::Plain(stream),
+            peer_addr,
+        })
     }
 
     const fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    fn into_split(self) -> (TcpProxyTargetReadHalf, TcpProxyTargetWriteHalf) {
+        match self.inner {
+            TcpProxyTargetStreamInner::Plain(stream) => {
+                let (read, write) = stream.into_split();
+                (
+                    TcpProxyTargetReadHalf::Plain(read),
+                    TcpProxyTargetWriteHalf::Plain(write),
+                )
+            }
+            TcpProxyTargetStreamInner::Boxed(stream) => {
+                let (read, write) = tokio::io::split(stream);
+                (
+                    TcpProxyTargetReadHalf::Boxed(read),
+                    TcpProxyTargetWriteHalf::Boxed(write),
+                )
+            }
+        }
     }
 }
 
@@ -1467,7 +1528,10 @@ impl AsyncRead for TcpProxyTargetStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_read(cx, buf)
+        match &mut self.get_mut().inner {
+            TcpProxyTargetStreamInner::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            TcpProxyTargetStreamInner::Boxed(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+        }
     }
 }
 
@@ -1477,15 +1541,104 @@ impl AsyncWrite for TcpProxyTargetStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
+        match &mut self.get_mut().inner {
+            TcpProxyTargetStreamInner::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            TcpProxyTargetStreamInner::Boxed(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut self.get_mut().inner {
+            TcpProxyTargetStreamInner::Plain(stream) => {
+                Pin::new(stream).poll_write_vectored(cx, bufs)
+            }
+            TcpProxyTargetStreamInner::Boxed(stream) => {
+                Pin::new(&mut **stream).poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match &self.inner {
+            TcpProxyTargetStreamInner::Plain(stream) => stream.is_write_vectored(),
+            TcpProxyTargetStreamInner::Boxed(stream) => stream.is_write_vectored(),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+        match &mut self.get_mut().inner {
+            TcpProxyTargetStreamInner::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            TcpProxyTargetStreamInner::Boxed(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+        match &mut self.get_mut().inner {
+            TcpProxyTargetStreamInner::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            TcpProxyTargetStreamInner::Boxed(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl AsyncRead for TcpProxyTargetReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(read) => Pin::new(read).poll_read(cx, buf),
+            Self::Boxed(read) => Pin::new(read).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TcpProxyTargetWriteHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(write) => Pin::new(write).poll_write(cx, buf),
+            Self::Boxed(write) => Pin::new(write).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(write) => Pin::new(write).poll_write_vectored(cx, bufs),
+            Self::Boxed(write) => Pin::new(write).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(write) => write.is_write_vectored(),
+            Self::Boxed(write) => write.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(write) => Pin::new(write).poll_flush(cx),
+            Self::Boxed(write) => Pin::new(write).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(write) => Pin::new(write).poll_shutdown(cx),
+            Self::Boxed(write) => Pin::new(write).poll_shutdown(cx),
+        }
     }
 }
 
@@ -6710,14 +6863,171 @@ where
         if read == 0 {
             break;
         }
-        match tokio::time::timeout(stall_timeout, writer.write_all(&buffer[..read])).await {
-            Ok(result) => result?,
-            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
-        }
+        write_all_with_stall_timeout(writer, &buffer[..read], stall_timeout).await?;
         copied += read as u64;
     }
     writer.flush().await?;
     Ok(copied)
+}
+
+async fn relay_copy_read_ahead_with_stall_timeout<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    stall_timeout: Duration,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buffers: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0_u8; RELAY_COPY_BUFFER_SIZE]);
+    let mut current = 0;
+    let mut current_len = reader.read(&mut buffers[current]).await?;
+    let mut copied = 0_u64;
+
+    while current_len != 0 {
+        let next = 1 - current;
+        let next_len = {
+            let (current_buffer, next_buffer) = if current == 0 {
+                let (current_buffer, next_buffer) = buffers.split_at_mut(1);
+                (&current_buffer[0][..current_len], &mut next_buffer[0])
+            } else {
+                let (next_buffer, current_buffer) = buffers.split_at_mut(1);
+                (&current_buffer[0][..current_len], &mut next_buffer[0])
+            };
+            let write = write_all_with_stall_timeout(writer, current_buffer, stall_timeout);
+            let read = reader.read(next_buffer);
+            tokio::pin!(write);
+            tokio::pin!(read);
+
+            // A speculative read error must not cancel a partially completed
+            // QUIC write, so retain it until the current buffer is committed.
+            let mut read_result = None;
+            let write_result = loop {
+                tokio::select! {
+                    result = &mut write => break result,
+                    result = &mut read, if read_result.is_none() => read_result = Some(result),
+                }
+            };
+            write_result?;
+            match read_result {
+                Some(result) => result?,
+                None => read.await?,
+            }
+        };
+
+        copied += current_len as u64;
+        current = next;
+        current_len = next_len;
+    }
+    writer.flush().await?;
+    Ok(copied)
+}
+
+const RELAY_QUIC_CHUNK_BATCH_SIZE: usize = 64;
+
+async fn relay_quic_chunks_to_target_with_stall_timeout<W>(
+    reader: &mut quinn::RecvStream,
+    writer: &mut W,
+    stall_timeout: Duration,
+) -> std::io::Result<u64>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut chunks: [bytes::Bytes; RELAY_QUIC_CHUNK_BATCH_SIZE] =
+        std::array::from_fn(|_| bytes::Bytes::new());
+    let mut copied = 0_u64;
+    while let Some(count) = reader
+        .read_chunks(&mut chunks)
+        .await
+        .map_err(std::io::Error::from)?
+    {
+        let batch = &mut chunks[..count];
+        copied += batch.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
+        write_all_vectored_with_stall_timeout(writer, batch, stall_timeout).await?;
+    }
+    writer.flush().await?;
+    Ok(copied)
+}
+
+async fn write_all_with_stall_timeout<W>(
+    writer: &mut W,
+    buffer: &[u8],
+    stall_timeout: Duration,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let write = writer.write_all(buffer);
+    tokio::pin!(write);
+    if std::future::poll_fn(|cx| match write.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(Some(result)),
+        Poll::Pending => Poll::Ready(None),
+    })
+    .await
+    .transpose()?
+    .is_some()
+    {
+        return Ok(());
+    }
+    match tokio::time::timeout(stall_timeout, write).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+    }
+}
+
+async fn write_all_vectored_with_stall_timeout<W>(
+    writer: &mut W,
+    chunks: &mut [bytes::Bytes],
+    stall_timeout: Duration,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let write = async {
+        let mut first = 0;
+        while first < chunks.len() {
+            let slices: [std::io::IoSlice<'_>; RELAY_QUIC_CHUNK_BATCH_SIZE] =
+                std::array::from_fn(|index| {
+                    std::io::IoSlice::new(
+                        chunks.get(first + index).map_or(&[], bytes::Bytes::as_ref),
+                    )
+                });
+            let written = writer
+                .write_vectored(&slices[..chunks.len() - first])
+                .await?;
+            if written == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+
+            let mut remaining = written;
+            while remaining != 0 {
+                if remaining < chunks[first].len() {
+                    chunks[first].advance(remaining);
+                    remaining = 0;
+                } else {
+                    remaining -= chunks[first].len();
+                    chunks[first] = bytes::Bytes::new();
+                    first += 1;
+                }
+            }
+        }
+        Ok(())
+    };
+    tokio::pin!(write);
+    if std::future::poll_fn(|cx| match write.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready(Some(result)),
+        Poll::Pending => Poll::Ready(None),
+    })
+    .await
+    .transpose()?
+    .is_some()
+    {
+        return Ok(());
+    }
+    match tokio::time::timeout(stall_timeout, write).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+    }
 }
 
 async fn relay_tcp_proxy_stream(
@@ -6728,37 +7038,71 @@ async fn relay_tcp_proxy_stream(
     stall_timeout: Duration,
 ) -> Result<TcpProxyRelayReport, TransportError> {
     let target = target_stream.peer_addr();
-    let (mut target_read, mut target_write) = tokio::io::split(target_stream);
+    let (mut target_read, mut target_write) = target_stream.into_split();
     let mut target_to_quic = quic_send;
     let mut client_to_target = quic_recv;
 
-    let client_to_target = async {
+    enum RelayDirectionReport {
+        ClientToTarget(u64),
+        TargetToClient(u64),
+    }
+
+    // JoinSet keeps both directions owned by this relay, so cancellation cannot
+    // detach a blocked sibling task.
+    let mut directions = tokio::task::JoinSet::new();
+    directions.spawn(async move {
         let mut bytes = 0_u64;
         if !initial_payload.is_empty() {
             target_write.write_all(&initial_payload).await?;
             bytes += initial_payload.len() as u64;
         }
-        bytes +=
-            relay_copy_with_stall_timeout(&mut client_to_target, &mut target_write, stall_timeout)
-                .await?;
+        bytes += relay_quic_chunks_to_target_with_stall_timeout(
+            &mut client_to_target,
+            &mut target_write,
+            stall_timeout,
+        )
+        .await?;
         target_write.shutdown().await?;
-        Ok::<_, TransportError>(bytes)
-    };
+        Ok::<_, TransportError>(RelayDirectionReport::ClientToTarget(bytes))
+    });
 
-    let target_to_client = async {
-        let bytes =
-            relay_copy_with_stall_timeout(&mut target_read, &mut target_to_quic, stall_timeout)
-                .await?;
+    directions.spawn(async move {
+        let bytes = match &mut target_read {
+            TcpProxyTargetReadHalf::Plain(target_read) => {
+                relay_copy_read_ahead_with_stall_timeout(
+                    target_read,
+                    &mut target_to_quic,
+                    stall_timeout,
+                )
+                .await?
+            }
+            TcpProxyTargetReadHalf::Boxed(target_read) => {
+                relay_copy_with_stall_timeout(target_read, &mut target_to_quic, stall_timeout)
+                    .await?
+            }
+        };
         target_to_quic.finish()?;
         // Await peer acknowledgement of the FIN before this task returns and the
         // connection is dropped, so a graceful close never races the client
         // draining the final bytes into a spurious `closed by peer` error.
         target_to_quic.stopped().await?;
-        Ok::<_, TransportError>(bytes)
-    };
+        Ok::<_, TransportError>(RelayDirectionReport::TargetToClient(bytes))
+    });
 
-    let (bytes_from_client, bytes_from_target) =
-        tokio::try_join!(client_to_target, target_to_client)?;
+    let mut bytes_from_client = None;
+    let mut bytes_from_target = None;
+    while let Some(result) = directions.join_next().await {
+        match result?? {
+            RelayDirectionReport::ClientToTarget(bytes) => bytes_from_client = Some(bytes),
+            RelayDirectionReport::TargetToClient(bytes) => bytes_from_target = Some(bytes),
+        }
+    }
+    let bytes_from_client = bytes_from_client.ok_or_else(|| {
+        std::io::Error::other("client-to-target relay task ended without a report")
+    })?;
+    let bytes_from_target = bytes_from_target.ok_or_else(|| {
+        std::io::Error::other("target-to-client relay task ended without a report")
+    })?;
     Ok(TcpProxyRelayReport {
         target,
         bytes_from_client,
@@ -6954,6 +7298,11 @@ mod tests {
     }
 
     #[test]
+    fn bbr_controller_uses_upstream_default_startup_window() {
+        assert_eq!(tls_config::bbr_initial_window_bytes(), 32 * 1280);
+    }
+
+    #[test]
     fn gso_mode_is_safe_by_default_and_opt_in_on_linux() {
         assert_eq!(GsoMode::from_env_values(None, None), GsoMode::Off);
         assert_eq!(GsoMode::from_env_values(Some("false"), None), GsoMode::Off);
@@ -6972,17 +7321,44 @@ mod tests {
     }
 
     #[test]
-    fn given_gso_off_when_linux_capabilities_are_queried_then_quinn_grouping_is_ten() {
+    fn gso_transmit_ceiling_preserves_plain_batching_and_clamps_opt_in() {
         let transport = build_transport_config(&QuicRuntimePolicy::upstream_client());
 
         if cfg!(target_os = "linux") {
-            assert_eq!(GsoMode::Off.max_transmit_segments(), 10);
-            assert_eq!(GsoMode::Auto.max_transmit_segments(), 10);
+            assert_eq!(GsoMode::Off.max_transmit_segments(96), 96);
+            assert_eq!(GsoMode::Auto.max_transmit_segments(32), 32);
+            assert_eq!(GsoMode::Auto.max_transmit_segments(44), 44);
+            assert_eq!(GsoMode::Auto.max_transmit_segments(96), 44);
             assert!(transport.segmentation_offload_enabled());
         } else {
-            assert_eq!(GsoMode::Off.max_transmit_segments(), 1);
-            assert_eq!(GsoMode::Auto.max_transmit_segments(), 1);
+            assert_eq!(udp_modes::plain_batch_segments_from_value(None, 96), 1);
             assert!(!transport.segmentation_offload_enabled());
+        }
+    }
+
+    #[test]
+    fn plain_batch_selector_uses_role_defaults_and_only_accepts_sweep_values() {
+        if cfg!(target_os = "linux") {
+            let client_default = udp_plain_batch::CLIENT_PLAIN_BATCH_DATAGRAMS;
+            let server_default = udp_plain_batch::SERVER_PLAIN_BATCH_DATAGRAMS;
+            assert_eq!(
+                udp_modes::plain_batch_segments_from_value(None, client_default),
+                88
+            );
+            assert_eq!(
+                udp_modes::plain_batch_segments_from_value(None, server_default),
+                96
+            );
+            assert_eq!(
+                udp_modes::plain_batch_segments_from_value(Some(" 64 "), client_default),
+                64
+            );
+            assert_eq!(
+                udp_modes::plain_batch_segments_from_value(Some("63"), client_default),
+                client_default
+            );
+        } else {
+            assert_eq!(udp_modes::plain_batch_segments_from_value(None, 88), 1);
         }
     }
 
@@ -12465,7 +12841,7 @@ mod tests {
 
     async fn run_gro_bulk_transfer(
         gro_mode: GroMode,
-    ) -> Result<(Arc<PlainUdpSocket>, usize), TransportError> {
+    ) -> Result<(Arc<PlainUdpSocket>, usize, u16), TransportError> {
         // Server echoes a multi-MiB upload; the bulk ingress drives the kernel
         // to coalesce same-sized datagrams when GRO is enabled. Returns the
         // server socket (for GRO-counter assertions) and the verified byte
@@ -12524,10 +12900,32 @@ mod tests {
         let echoed = recv.read_to_end(payload_len).await?;
         assert_eq!(echoed.len(), payload_len, "echo returns the full payload");
         assert_eq!(echoed, upload, "echoed bytes match the upload exactly");
+        let current_mtu = connection.stats().path.current_mtu;
 
         let server_read = server_task.await??;
         assert_eq!(server_read, payload_len);
-        Ok((server_socket, server_read))
+        Ok((server_socket, server_read, current_mtu))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gro_socket_reports_the_fragmentation_capability_configured_on_its_fd()
+    -> Result<(), TransportError> {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let socket = PlainUdpSocket::with_test_config(
+            socket,
+            PlainUdpTestConfig::new(GsoMode::Off, GroMode::Auto),
+        )?;
+        let state = socket
+            .gro_recv
+            .as_ref()
+            .expect("Linux GRO setup must retain the configured UDP socket state");
+        assert_eq!(
+            quinn::AsyncUdpSocket::may_fragment(&socket),
+            state.may_fragment(),
+            "the wrapper must expose the DF capability configured on the real socket"
+        );
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -12537,7 +12935,11 @@ mod tests {
         // coalesces same-sized datagrams into super-buffers; the GRO recv path
         // must split them by the cmsg-reported stride (so the echo stays byte
         // exact) and tally the coalescing counters.
-        let (server_socket, _len) = run_gro_bulk_transfer(GroMode::Auto).await?;
+        let (server_socket, _len, current_mtu) = run_gro_bulk_transfer(GroMode::Auto).await?;
+        assert!(
+            current_mtu > 1200,
+            "DF-capable GRO sockets must allow Quinn MTU discovery above its initial MTU"
+        );
 
         // GRO batching is environmental (kernel/path/load). If the receive
         // socket never gets coalesced buffers, integrity still proves the
@@ -12562,7 +12964,7 @@ mod tests {
     async fn gro_disabled_path_transfers_without_coalescing() -> Result<(), TransportError> {
         // With GRO Off the same bulk transfer must still round-trip byte-exact,
         // and the GRO counters must stay at zero (no coalescing path taken).
-        let (server_socket, _len) = run_gro_bulk_transfer(GroMode::Off).await?;
+        let (server_socket, _len, current_mtu) = run_gro_bulk_transfer(GroMode::Off).await?;
         assert!(
             server_socket.gro_recv.is_none(),
             "GroMode::Off must not build a GRO receiver"
@@ -12577,6 +12979,10 @@ mod tests {
             counters.gro_segments_total.load(Ordering::Relaxed),
             0,
             "no GRO segments counted when GRO is disabled"
+        );
+        assert_eq!(
+            current_mtu, 1200,
+            "fragmenting fallback sockets must keep Quinn MTU discovery disabled"
         );
         Ok(())
     }
@@ -13043,5 +13449,200 @@ mod tests {
 
         feeder.await.expect("feeder task");
         assert_eq!(copied, 5 * 1024);
+    }
+
+    struct ReadAheadReader {
+        payload: Vec<u8>,
+        offset: usize,
+        reads: usize,
+        second_read: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for ReadAheadReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.offset == self.payload.len() {
+                return Poll::Ready(Ok(()));
+            }
+            self.reads += 1;
+            if self.reads == 2
+                && let Some(second_read) = self.second_read.take()
+            {
+                let _ = second_read.send(());
+            }
+            let end = self
+                .offset
+                .saturating_add(buffer.remaining())
+                .min(self.payload.len());
+            buffer.put_slice(&self.payload[self.offset..end]);
+            self.offset = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct GatedWriter {
+        released: Arc<std::sync::atomic::AtomicBool>,
+        waker: Arc<Mutex<Option<std::task::Waker>>>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.released.load(std::sync::atomic::Ordering::Acquire) {
+                *self.waker.lock().expect("lock gated writer waker") = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            self.output
+                .lock()
+                .expect("lock gated writer output")
+                .extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_copy_read_ahead_polls_next_read_while_current_write_is_pending() {
+        let payload = vec![0x4d; 2 * RELAY_COPY_BUFFER_SIZE];
+        let expected = payload.clone();
+        let (second_read_tx, second_read_rx) = tokio::sync::oneshot::channel();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waker = Arc::new(Mutex::new(None));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = ReadAheadReader {
+            payload,
+            offset: 0,
+            reads: 0,
+            second_read: Some(second_read_tx),
+        };
+        let mut writer = GatedWriter {
+            released: Arc::clone(&released),
+            waker: Arc::clone(&waker),
+            output: Arc::clone(&output),
+        };
+
+        let relay = tokio::spawn(async move {
+            relay_copy_read_ahead_with_stall_timeout(
+                &mut reader,
+                &mut writer,
+                Duration::from_secs(5),
+            )
+            .await
+        });
+        let read_ahead = tokio::time::timeout(Duration::from_millis(250), second_read_rx).await;
+        released.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(waker) = waker.lock().expect("lock gated writer waker").take() {
+            waker.wake();
+        }
+
+        let copied = relay.await.expect("join relay").expect("copy payload");
+        assert!(
+            read_ahead.is_ok(),
+            "the next target read must be polled before the current QUIC write completes"
+        );
+        assert_eq!(copied, expected.len() as u64);
+        assert_eq!(*output.lock().expect("lock final output"), expected);
+    }
+
+    struct PartialVectoredWriter {
+        output: Vec<u8>,
+        max_write: usize,
+        vectored_calls: usize,
+    }
+
+    impl AsyncWrite for PartialVectoredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let written = buffer.len().min(self.max_write);
+            self.output.extend_from_slice(&buffer[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffers: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_calls += 1;
+            let mut written = 0;
+            for buffer in buffers {
+                let take = buffer.len().min(self.max_write - written);
+                self.output.extend_from_slice(&buffer[..take]);
+                written += take;
+                if written == self.max_write {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_all_vectored_with_stall_timeout_drains_partial_writes() {
+        let mut chunks = [
+            bytes::Bytes::from_static(b"abc"),
+            bytes::Bytes::from_static(b"defgh"),
+            bytes::Bytes::from_static(b"ij"),
+        ];
+        let mut writer = PartialVectoredWriter {
+            output: Vec::new(),
+            max_write: 4,
+            vectored_calls: 0,
+        };
+
+        write_all_vectored_with_stall_timeout(&mut writer, &mut chunks, Duration::from_secs(30))
+            .await
+            .expect("partial vectored writes must drain every chunk");
+
+        assert_eq!(writer.output, b"abcdefghij");
+        assert_eq!(writer.vectored_calls, 3);
+        assert!(chunks.iter().all(bytes::Bytes::is_empty));
+    }
+
+    #[tokio::test]
+    async fn write_all_vectored_with_stall_timeout_fires_on_stalled_writer() {
+        let mut chunks = [bytes::Bytes::from_static(b"payload")];
+        let mut writer = StalledWriter;
+
+        let started = tokio::time::Instant::now();
+        let error = write_all_vectored_with_stall_timeout(
+            &mut writer,
+            &mut chunks,
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("stalled vectored writer must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

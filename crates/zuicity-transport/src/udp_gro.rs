@@ -9,35 +9,37 @@ impl PlainUdpSocket {
     /// segment-size cmsg correctly (the unsafe `recvmsg`/cmsg work lives inside
     /// quinn-udp, so this crate stays `forbid(unsafe_code)`).
     ///
-    /// If `UdpSocketState::new` fails — which is how GRO-hostile paths surface,
-    /// since it also probes other receive options — the error is swallowed and
-    /// `None` is returned, so [`crate::PlainUdpSocket::poll_recv`] falls back to the historical plain
-    /// per-datagram path and the cross-host handshake is never stranded. The ECN
-    /// and dst-ip values quinn would parse are discarded in [`Self::recv_gro_batch`],
-    /// so this path stays wire- and reliability-equivalent to the plain one.
+    /// If `UdpSocketState::new` fails - which is how GRO-hostile paths surface,
+    /// since it also probes other receive options - the error is swallowed and
+    /// `None` is returned, so [`crate::PlainUdpSocket::poll_recv`] falls back to
+    /// the historical plain per-datagram path and the cross-host handshake is
+    /// never stranded. The ECN and dst-ip values quinn would parse are discarded
+    /// in [`Self::recv_gro_batch`], so this path stays wire- and
+    /// reliability-equivalent to the plain one.
     #[cfg(target_os = "linux")]
     pub(super) fn build_gro_receiver(
         socket: &std::net::UdpSocket,
         gro_mode: GroMode,
-    ) -> GroReceiver {
+    ) -> (GroReceiver, bool) {
         if !matches!(gro_mode, GroMode::Auto) {
-            return None;
+            return (None, true);
         }
         match quinn::udp::UdpSocketState::new(socket.into()) {
             Ok(state) if state.gro_segments() > 1 => {
+                let may_fragment = state.may_fragment();
                 tracing::debug!(
                     gro_segments = state.gro_segments(),
                     "udp gro enabled on receive socket"
                 );
-                Some(Arc::new(state))
+                (Some(Arc::new(state)), may_fragment)
             }
-            Ok(_) => {
+            Ok(state) => {
                 tracing::debug!("udp gro reports a single segment; receiving plain datagrams");
-                None
+                (None, state.may_fragment())
             }
             Err(error) => {
                 tracing::debug!(%error, "udp gro setup rejected by this path; receiving plain datagrams");
-                None
+                (None, true)
             }
         }
     }
@@ -46,15 +48,15 @@ impl PlainUdpSocket {
     pub(super) fn build_gro_receiver(
         _socket: &std::net::UdpSocket,
         _gro_mode: GroMode,
-    ) -> GroReceiver {
-        None
+    ) -> (GroReceiver, bool) {
+        (None, true)
     }
 
     /// GRO batched receive: delegates to [`quinn::udp::UdpSocketState::recv`],
     /// which performs the `recvmsg`/`recvmmsg` and parses the kernel `UDP_GRO`
     /// control message into each [`quinn::udp::RecvMeta::stride`] (the
     /// per-segment size). quinn-proto then re-splits a coalesced super-buffer
-    /// into `ceil(len / stride)` segments, so QUIC decode stays correct — the
+    /// into `ceil(len / stride)` segments, so QUIC decode stays correct - the
     /// reason a coalesced buffer must never be handed over with `stride == len`.
     ///
     /// quinn's parser also fills `ecn` and `dst_ip` from their cmsgs; both are

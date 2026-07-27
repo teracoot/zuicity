@@ -1502,8 +1502,6 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 [[package]]
 name = "quinn"
 version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1523,8 +1521,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -2982,7 +2978,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zuicity-benchmarks"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -3000,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3026,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "rcgen",
@@ -3043,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "hex",
@@ -3057,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-dae"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -3075,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3088,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3116,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "zuicity-testkit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -3128,10 +3124,11 @@ dependencies = [
 
 [[package]]
 name = "zuicity-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "arrayvec",
  "base64",
  "bytes",
  "crc32fast",

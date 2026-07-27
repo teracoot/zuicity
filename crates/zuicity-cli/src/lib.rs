@@ -54,20 +54,29 @@ pub fn format_read_config_decode_error(input: &str, err: zuicity_config::ConfigE
 ///
 /// Returns `None` to keep tokio's default (one worker per core). Otherwise the
 /// runtime is capped so idle deployments do not pay a per-core worker stack and
-/// allocator arena. `ZUICITY_WORKER_THREADS` overrides the cap (0 = tokio
-/// default); absent, the cap is `min(available cores, 4)`.
-pub fn zuicity_runtime_worker_threads() -> Option<usize> {
-    if let Ok(raw) = std::env::var("ZUICITY_WORKER_THREADS") {
+/// allocator arena. `ZUICITY_WORKER_THREADS` overrides the role-specific cap
+/// (0 = tokio default).
+pub fn zuicity_runtime_worker_threads(default_cap: usize) -> Option<usize> {
+    let value = std::env::var("ZUICITY_WORKER_THREADS").ok();
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    runtime_worker_threads_from_value(value.as_deref(), default_cap, cores)
+}
+
+fn runtime_worker_threads_from_value(
+    value: Option<&str>,
+    default_cap: usize,
+    available_cores: usize,
+) -> Option<usize> {
+    if let Some(raw) = value {
         return match raw.trim().parse::<usize>() {
             Ok(0) => None,
             Ok(n) => Some(n),
             Err(_) => None,
         };
     }
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    Some(cores.min(4).max(1))
+    Some(available_cores.min(default_cap).max(1))
 }
 
 /// Upstream logging output target.
@@ -1048,6 +1057,19 @@ mod tests {
     use clap::{CommandFactory, error::ErrorKind};
 
     use super::*;
+
+    #[test]
+    fn runtime_worker_defaults_are_role_specific_and_overridable() {
+        assert_eq!(runtime_worker_threads_from_value(None, 4, 16), Some(4));
+        assert_eq!(runtime_worker_threads_from_value(None, 2, 16), Some(2));
+        assert_eq!(runtime_worker_threads_from_value(None, 4, 1), Some(1));
+        assert_eq!(runtime_worker_threads_from_value(Some("8"), 2, 16), Some(8));
+        assert_eq!(runtime_worker_threads_from_value(Some("0"), 2, 16), None);
+        assert_eq!(
+            runtime_worker_threads_from_value(Some("invalid"), 2, 16),
+            None
+        );
+    }
 
     #[test]
     fn log_args_normalize_upstream_timestamp_and_output_defaults() {

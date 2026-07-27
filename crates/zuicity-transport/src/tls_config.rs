@@ -58,22 +58,22 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
 /// Installs the policy's congestion controller on a quinn [`TransportConfig`].
 ///
 /// Quinn defaults to CUBIC; upstream Juicity negotiates `congestion_control=bbr`,
-/// so without this hook zuicity advertised BBR but ran CUBIC. Translates the
-/// upstream packet-denominated window (`policy.cwnd`) into BBR's byte-denominated
-/// `initial_window`.
+/// so without this hook zuicity advertised BBR but ran CUBIC. Upstream's hook
+/// ignores the configured `cwnd` argument and its BBR starts at 32 packets.
 fn apply_congestion_controller(inner: &mut quinn::TransportConfig, policy: &QuicRuntimePolicy) {
     match policy.congestion_controller {
         CongestionController::Bbr => {
-            // policy.cwnd is in packets; BbrConfig::initial_window wants bytes.
-            const CONSERVATIVE_DATAGRAM_BYTES: u64 = 1200;
             let mut bbr = quinn::congestion::BbrConfig::default();
-            let requested = u64::from(policy.cwnd).saturating_mul(CONSERVATIVE_DATAGRAM_BYTES);
-            // Never start below quinn-proto's own BBR default floor (14720).
-            let initial_window = requested.max(14_720);
-            bbr.initial_window(initial_window);
+            bbr.initial_window(bbr_initial_window_bytes());
             inner.congestion_controller_factory(std::sync::Arc::new(bbr));
         }
     }
+}
+
+pub(crate) const fn bbr_initial_window_bytes() -> u64 {
+    const UPSTREAM_BBR_INITIAL_WINDOW_PACKETS: u64 = 32;
+    const UPSTREAM_INITIAL_PACKET_BYTES: u64 = 1280;
+    UPSTREAM_BBR_INITIAL_WINDOW_PACKETS * UPSTREAM_INITIAL_PACKET_BYTES
 }
 
 /// Builds upstream-compatible rustls server crypto from PEM certificate and key bytes.

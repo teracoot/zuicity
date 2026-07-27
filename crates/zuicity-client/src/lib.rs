@@ -1075,6 +1075,53 @@ where
     Ok(copied)
 }
 
+async fn relay_copy_local_to_quic<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut buffers: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0_u8; RELAY_COPY_BUFFER_SIZE]);
+    let mut current = 0;
+    let mut current_len = reader.read(&mut buffers[current]).await?;
+    let mut copied = 0_u64;
+
+    while current_len != 0 {
+        let next = 1 - current;
+        let next_len = {
+            let (current_buffer, next_buffer) = if current == 0 {
+                let (current_buffer, next_buffer) = buffers.split_at_mut(1);
+                (&current_buffer[0][..current_len], &mut next_buffer[0])
+            } else {
+                let (next_buffer, current_buffer) = buffers.split_at_mut(1);
+                (&current_buffer[0][..current_len], &mut next_buffer[0])
+            };
+            let write = writer.write_all(current_buffer);
+            let read = reader.read(next_buffer);
+            tokio::pin!(write);
+            tokio::pin!(read);
+
+            let mut read_result = None;
+            let write_result = loop {
+                tokio::select! {
+                    result = &mut write => break result,
+                    result = &mut read, if read_result.is_none() => read_result = Some(result),
+                }
+            };
+            write_result?;
+            match read_result {
+                Some(result) => result?,
+                None => read.await?,
+            }
+        };
+
+        copied += current_len as u64;
+        current = next;
+        current_len = next_len;
+    }
+    writer.flush().await?;
+    Ok(copied)
+}
+
 async fn relay_local_tcp_stream(
     local_stream: tokio::net::TcpStream,
     local_peer: SocketAddr,
@@ -1089,7 +1136,7 @@ async fn relay_local_tcp_stream(
     let (mut local_read, mut local_write) = local_stream.into_split();
 
     let local_to_remote = async {
-        let bytes = relay_copy(&mut local_read, &mut quic_send).await?;
+        let bytes = relay_copy_local_to_quic(&mut local_read, &mut quic_send).await?;
         quic_send
             .finish()
             .map_err(zuicity_transport::TransportError::from)?;
@@ -1878,6 +1925,113 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ReadAheadReader {
+        payload: Vec<u8>,
+        offset: usize,
+        reads: usize,
+        second_read: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncRead for ReadAheadReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.offset == self.payload.len() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.reads += 1;
+            if self.reads == 2
+                && let Some(second_read) = self.second_read.take()
+            {
+                let _ = second_read.send(());
+            }
+            let end = self
+                .offset
+                .saturating_add(buffer.remaining())
+                .min(self.payload.len());
+            buffer.put_slice(&self.payload[self.offset..end]);
+            self.offset = end;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct GatedWriter {
+        released: Arc<std::sync::atomic::AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.released.load(std::sync::atomic::Ordering::Acquire) {
+                *self.waker.lock().expect("lock gated writer waker") = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+            self.output
+                .lock()
+                .expect("lock gated writer output")
+                .extend_from_slice(buffer);
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn client_local_to_quic_relay_reads_ahead_while_write_is_pending() {
+        let payload = vec![0x63; 2 * RELAY_COPY_BUFFER_SIZE];
+        let expected = payload.clone();
+        let (second_read_tx, second_read_rx) = tokio::sync::oneshot::channel();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waker = Arc::new(std::sync::Mutex::new(None));
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reader = ReadAheadReader {
+            payload,
+            offset: 0,
+            reads: 0,
+            second_read: Some(second_read_tx),
+        };
+        let mut writer = GatedWriter {
+            released: Arc::clone(&released),
+            waker: Arc::clone(&waker),
+            output: Arc::clone(&output),
+        };
+
+        let relay =
+            tokio::spawn(async move { relay_copy_local_to_quic(&mut reader, &mut writer).await });
+        let read_ahead = tokio::time::timeout(Duration::from_millis(250), second_read_rx).await;
+        released.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(waker) = waker.lock().expect("lock gated writer waker").take() {
+            waker.wake();
+        }
+
+        let copied = relay.await.expect("join relay").expect("copy payload");
+        assert!(
+            read_ahead.is_ok(),
+            "the next local TCP read must be polled before the current QUIC write completes"
+        );
+        assert_eq!(copied, expected.len() as u64);
+        assert_eq!(*output.lock().expect("lock final output"), expected);
+    }
 
     #[test]
     fn client_dialer_binds_unspecified_address_of_server_family() {

@@ -57,7 +57,7 @@ fn run_client_runtime(
     logger: RuntimeTracingLoggerHandle,
 ) -> anyhow::Result<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(threads) = zuicity_runtime_worker_threads() {
+    if let Some(threads) = zuicity_runtime_worker_threads(4) {
         builder.worker_threads(threads);
     }
     builder

@@ -10,6 +10,7 @@ members = [
     "crates/zuicity-benchmarks",
     "crates/zuicity-testkit",
 ]
+exclude = ["vendor/quinn-0.11.9", "vendor/quinn-proto-0.11.14"]
 resolver = "3"
 
 [workspace.package]
@@ -17,7 +18,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/teracoot/zuicity"
 rust-version = "1.96"
-version = "0.3.0"
+version = "0.4.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -40,6 +41,7 @@ unwrap_used = "warn"
 anyhow = "1"
 aes = "0.8"
 aes-gcm = "0.10"
+arrayvec = "0.7"
 base64 = "0.22"
 bytes = "1"
 crc32fast = "1"
@@ -83,3 +85,7 @@ codegen-units = 1
 lto = "fat"
 panic = "abort"
 strip = "symbols"
+
+[patch.crates-io]
+quinn = { path = "vendor/quinn-0.11.9" }
+quinn-proto = { path = "vendor/quinn-proto-0.11.14" }

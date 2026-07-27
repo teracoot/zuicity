@@ -5,13 +5,14 @@ use std::{
     time::Instant,
 };
 
+use arrayvec::ArrayVec;
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     net::{MMsgHdr, SendAncillaryBuffer, SendFlags, SocketAddrAny, sendmmsg},
 };
 
 use crate::{
-    udp_plain_batch::{BatchProgress, OwnedTransmit},
+    udp_plain_batch::{MAX_PLAIN_BATCH_DATAGRAMS, PlainTransmit},
     udp_state::PlainSendCounters,
 };
 
@@ -50,17 +51,17 @@ impl PlainBatchIo {
     pub(super) fn attempt(
         &self,
         counters: &PlainSendCounters,
-        progress: &BatchProgress,
-    ) -> io::Result<Vec<usize>> {
+        transmit: PlainTransmit<'_>,
+    ) -> io::Result<ArrayVec<usize, MAX_PLAIN_BATCH_DATAGRAMS>> {
         let mut interrupted = 0;
         let mut clear_cached_readiness = false;
         loop {
             let result = if clear_cached_readiness {
                 self.socket.try_io(tokio::io::Interest::WRITABLE, || {
-                    self.attempt_once(counters, progress)
+                    self.attempt_once(counters, transmit)
                 })
             } else {
-                self.attempt_once(counters, progress)
+                self.attempt_once(counters, transmit)
             };
             match result {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -82,14 +83,14 @@ impl PlainBatchIo {
     fn attempt_once(
         &self,
         counters: &PlainSendCounters,
-        progress: &BatchProgress,
-    ) -> io::Result<Vec<usize>> {
+        transmit: PlainTransmit<'_>,
+    ) -> io::Result<ArrayVec<usize, MAX_PLAIN_BATCH_DATAGRAMS>> {
         counters.sendmmsg_calls.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         if let Some(hook) = &self.hook {
-            return hook.attempt(progress.transmit());
+            return hook.attempt(transmit);
         }
-        sendmmsg_once(self.socket.as_ref(), progress.transmit())
+        sendmmsg_once(self.socket.as_ref(), transmit)
     }
 
     pub(super) fn wait_writable(&self, deadline: Instant) -> io::Result<()> {
@@ -147,43 +148,38 @@ fn poll_error(socket: &tokio::net::UdpSocket, events: PollFlags) -> io::Result<(
 
 fn sendmmsg_once(
     socket: &tokio::net::UdpSocket,
-    transmit: &OwnedTransmit,
-) -> io::Result<Vec<usize>> {
+    transmit: PlainTransmit<'_>,
+) -> io::Result<ArrayVec<usize, MAX_PLAIN_BATCH_DATAGRAMS>> {
     let _metadata_ignored_by_plain_path = (transmit.ecn, transmit.src_ip);
     let address = SocketAddrAny::from(transmit.destination);
     let datagram_count = transmit.datagram_count();
-    let mut iovecs = Vec::new();
-    iovecs
-        .try_reserve_exact(datagram_count)
-        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-    iovecs.extend(
-        transmit
-            .datagrams()
-            .map(|datagram| [IoSlice::new(datagram)]),
-    );
-    let mut controls = Vec::new();
-    controls
-        .try_reserve_exact(datagram_count)
-        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-    controls.resize_with(datagram_count, SendAncillaryBuffer::default);
-    let mut messages = Vec::new();
-    messages
-        .try_reserve_exact(datagram_count)
-        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-    messages.extend(
+    let mut iovecs = ArrayVec::<_, MAX_PLAIN_BATCH_DATAGRAMS>::new();
+    for datagram in transmit.datagrams() {
         iovecs
-            .iter()
-            .zip(controls.iter_mut())
-            .map(|(iov, control)| MMsgHdr::new_with_addr(&address, iov, control)),
-    );
-    let mut sent_lengths = Vec::new();
-    sent_lengths
-        .try_reserve_exact(datagram_count)
-        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            .try_push([IoSlice::new(datagram)])
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    }
+    let mut controls = ArrayVec::<_, MAX_PLAIN_BATCH_DATAGRAMS>::new();
+    for _ in 0..datagram_count {
+        controls
+            .try_push(SendAncillaryBuffer::default())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    }
+    let mut messages = ArrayVec::<_, MAX_PLAIN_BATCH_DATAGRAMS>::new();
+    for (iov, control) in iovecs.iter().zip(controls.iter_mut()) {
+        messages
+            .try_push(MMsgHdr::new_with_addr(&address, iov, control))
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    }
     let count = sendmmsg(socket, &mut messages, SendFlags::DONTWAIT).map_err(io::Error::from)?;
     if count > messages.len() {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    sent_lengths.extend(messages.iter().take(count).map(MMsgHdr::bytes_sent));
+    let mut sent_lengths = ArrayVec::<_, MAX_PLAIN_BATCH_DATAGRAMS>::new();
+    for message in messages.iter().take(count) {
+        sent_lengths
+            .try_push(message.bytes_sent())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    }
     Ok(sent_lengths)
 }
