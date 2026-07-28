@@ -19,11 +19,14 @@ pub(super) fn build_ecn_safe_endpoint_from_socket(
     socket: std::net::UdpSocket,
     server_config: Option<quinn::ServerConfig>,
 ) -> Result<quinn::Endpoint, TransportError> {
+    #[cfg(target_os = "linux")]
     let default_plain_batch_segments = if server_config.is_some() {
         crate::udp_plain_batch::SERVER_PLAIN_BATCH_DATAGRAMS
     } else {
         crate::udp_plain_batch::CLIENT_PLAIN_BATCH_DATAGRAMS
     };
+    #[cfg(not(target_os = "linux"))]
+    let default_plain_batch_segments = 1;
     let runtime =
         quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
