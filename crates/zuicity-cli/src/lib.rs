@@ -641,6 +641,7 @@ where
     F: io::Write + Send + 'static,
 {
     handle: RuntimeTracingLoggerHandle<C, F>,
+    level: LogLevel,
 }
 
 /// Handle for retrieving the logger owned by a [`RuntimeTracingLayer`].
@@ -673,12 +674,14 @@ where
     /// Creates a layer and a retrieval handle around a runtime logger.
     #[must_use]
     pub fn new(logger: RuntimeLogger<C, F>) -> (Self, RuntimeTracingLoggerHandle<C, F>) {
+        let level = logger.settings().level;
         let handle = RuntimeTracingLoggerHandle {
             inner: Arc::new(Mutex::new(Some(logger))),
         };
         (
             Self {
                 handle: handle.clone(),
+                level,
             },
             handle,
         )
@@ -721,6 +724,42 @@ where
     F: io::Write + Send + 'static,
     S: tracing::Subscriber,
 {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if self
+            .level
+            .allows(tracing_level_to_log_level(metadata.level()))
+        {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.level
+            .allows(tracing_level_to_log_level(metadata.level()))
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(match self.level {
+            LogLevel::Trace => tracing::metadata::LevelFilter::TRACE,
+            LogLevel::Debug => tracing::metadata::LevelFilter::DEBUG,
+            LogLevel::Info => tracing::metadata::LevelFilter::INFO,
+            LogLevel::Warn => tracing::metadata::LevelFilter::WARN,
+            LogLevel::Error => tracing::metadata::LevelFilter::ERROR,
+            LogLevel::NoLevel | LogLevel::Fatal | LogLevel::Panic => {
+                tracing::metadata::LevelFilter::OFF
+            }
+        })
+    }
+
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
@@ -1249,6 +1288,14 @@ mod tests {
     fn runtime_tracing_layer_writes_events_through_runtime_logger() {
         use tracing_subscriber::prelude::*;
 
+        struct PanicDebug;
+
+        impl std::fmt::Debug for PanicDebug {
+            fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("disabled tracing fields must not be formatted");
+            }
+        }
+
         let settings = LogSettings {
             level: LogLevel::Debug,
             outputs: vec![LogOutput::Console, LogOutput::File],
@@ -1272,6 +1319,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(value = ?PanicDebug, "disabled event");
             tracing::info!(
                 target: "zuicity_cli::tests",
                 network = "tcp",

@@ -6,7 +6,7 @@ use aes_gcm::{
     aead::{Aead, Payload},
 };
 use base64::{Engine, engine::general_purpose};
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256};
@@ -6856,14 +6856,15 @@ where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
 {
-    let mut buffer = vec![0_u8; RELAY_COPY_BUFFER_SIZE];
+    let mut buffer = BytesMut::with_capacity(RELAY_COPY_BUFFER_SIZE);
     let mut copied = 0_u64;
     loop {
-        let read = reader.read(&mut buffer).await?;
+        buffer.clear();
+        let read = reader.read_buf(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        write_all_with_stall_timeout(writer, &buffer[..read], stall_timeout).await?;
+        write_all_with_stall_timeout(writer, &buffer, stall_timeout).await?;
         copied += read as u64;
     }
     writer.flush().await?;
@@ -6879,13 +6880,15 @@ where
     R: AsyncRead + Unpin + ?Sized,
     W: AsyncWrite + Unpin + ?Sized,
 {
-    let mut buffers: [Vec<u8>; 2] = std::array::from_fn(|_| vec![0_u8; RELAY_COPY_BUFFER_SIZE]);
+    let mut buffers: [BytesMut; 2] =
+        std::array::from_fn(|_| BytesMut::with_capacity(RELAY_COPY_BUFFER_SIZE));
     let mut current = 0;
-    let mut current_len = reader.read(&mut buffers[current]).await?;
+    let mut current_len = reader.read_buf(&mut buffers[current]).await?;
     let mut copied = 0_u64;
 
     while current_len != 0 {
         let next = 1 - current;
+        buffers[next].clear();
         let next_len = {
             let (current_buffer, next_buffer) = if current == 0 {
                 let (current_buffer, next_buffer) = buffers.split_at_mut(1);
@@ -6895,7 +6898,7 @@ where
                 (&current_buffer[0][..current_len], &mut next_buffer[0])
             };
             let write = write_all_with_stall_timeout(writer, current_buffer, stall_timeout);
-            let read = reader.read(next_buffer);
+            let read = reader.read_buf(next_buffer);
             tokio::pin!(write);
             tokio::pin!(read);
 
