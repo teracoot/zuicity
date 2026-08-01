@@ -251,16 +251,26 @@ jobs:
           fi
           scripts/package-release.sh "${args[@]}"
 
-      - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload package archive directly
+        uses: actions/upload-artifact@v7
         with:
-          name: zuicity-${{ matrix.friendly_name }}
-          path: |
-            release-package-${{ matrix.friendly_name }}/*.zip
-            release-package-${{ matrix.friendly_name }}/*.zip.dgst
-            release-package-${{ matrix.friendly_name }}/*.zip.sha256
-            release-package-${{ matrix.friendly_name }}/manifest.txt
-            release-package-${{ matrix.friendly_name }}/*.manifest.txt
+          path: release-package-${{ matrix.friendly_name }}/zuicity-${{ matrix.friendly_name }}.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload package digest directly
+        uses: actions/upload-artifact@v7
+        with:
+          path: release-package-${{ matrix.friendly_name }}/zuicity-${{ matrix.friendly_name }}.zip.dgst
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload package SHA-256 directly
+        uses: actions/upload-artifact@v7
+        with:
+          path: release-package-${{ matrix.friendly_name }}/zuicity-${{ matrix.friendly_name }}.zip.sha256
+          archive: false
+          if-no-files-found: error
 
   source-package:
     needs: validate-tag
@@ -290,14 +300,26 @@ jobs:
           sha512sum "$archive" >> "$archive.dgst"
           sha256sum "$archive" > "$archive.sha256"
 
-      - name: Upload source artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload source archive directly
+        uses: actions/upload-artifact@v7
         with:
-          name: zuicity-full-src
-          path: |
-            source-package/zuicity-full-src.zip
-            source-package/zuicity-full-src.zip.dgst
-            source-package/zuicity-full-src.zip.sha256
+          path: source-package/zuicity-full-src.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload source digest directly
+        uses: actions/upload-artifact@v7
+        with:
+          path: source-package/zuicity-full-src.zip.dgst
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload source SHA-256 directly
+        uses: actions/upload-artifact@v7
+        with:
+          path: source-package/zuicity-full-src.zip.sha256
+          archive: false
+          if-no-files-found: error
 
   upload-release:
     if: ${{ inputs.platform == 'all' && inputs.publish_release == 'true' && inputs.source_ref == '' }}
@@ -309,9 +331,12 @@ jobs:
       contents: write
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release
+          pattern: zuicity-*
+          merge-multiple: true
+          skip-decompress: true
 
       - name: Upload GitHub release assets
         uses: softprops/action-gh-release@v2
@@ -319,5 +344,5 @@ jobs:
           tag_name: ${{ inputs.tag }}
           prerelease: ${{ fromJSON(inputs.prerelease) }}
           files: |
-            release/**/*.zip
-            release/**/*.zip.dgst
+            release/*.zip
+            release/*.zip.dgst

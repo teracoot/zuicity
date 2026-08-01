@@ -14,10 +14,11 @@ built upon and highly inspired by the upstream
 
 It re-implements the juicity protocol on top of [quinn](https://github.com/quinn-rs/quinn)
 and [tokio](https://github.com/tokio-rs/tokio), keeping byte-for-byte wire and
-authentication compatibility with the upstream Go server and client, while
-roughly doubling its TCP throughput and using close to half its memory. The port
-is validated not only on a loopback test bench but over real cross-host network
-paths and against a live, public Go juicity server on the Internet.
+authentication compatibility with the upstream Go server and client. In the
+latest matched local-veth campaign, v0.4.0 delivered 1.77x stock Go throughput
+with 56% less combined peak process memory. The port is validated not only on a
+local test bench but over real cross-host network paths and against a live,
+public Go juicity server on the Internet.
 
 As a drop-in replacement for the upstream client and server, zuicity speaks
 the same `run -c <config.json>` interface and the same config schema, so existing
@@ -25,12 +26,12 @@ juicity deployments interoperate with it unchanged.
 
 ## Highlights
 
-- **Faster.** ~1.8x the TCP throughput of upstream Go juicity, with lower
-  fresh-connect and persistent round-trip latency, on an identical real
-  cross-host benchmark.
-- **Leaner.** About a third of the server resident memory of upstream Go juicity
-  on a real WAN server (~13 MB vs ~37 MB), with no leak: resident memory plateaus
-  under load and freezes flat when idle.
+- **Faster.** In the matched GSO-on campaign, v0.4.0 reached 1278.97 Mbps:
+  74.03% higher paired throughput than stock Go v0.5.0 and 19.69% higher than
+  repaired full-GSO Go v0.5.0.
+- **Leaner.** Combined peak process memory was 16,974 KiB versus 38,464 KiB for
+  stock Go in the matched campaign. On a historical real-WAN server, zuicity
+  used ~13 MB versus ~37 MB for Go, with no observed leak.
 - **Reliable.** Release builds keep UDP GSO opt-in for path safety on hostile
   egresses (veth, tun/VPN, virtio, many cloud NICs), while GRO remains
   receive-only and wire-invisible; the cross-host suite passes over IPv4, IPv6,
@@ -40,20 +41,43 @@ juicity deployments interoperate with it unchanged.
 
 ## Benchmarks
 
-Two-namespace `veth` benchmark (real IP stack and real QUIC, not loopback),
-median of 5 repetitions per implementation. Lower is better for latency and
-memory; higher is better for throughput.
+This matched campaign used two fresh Linux network namespaces joined by a
+`veth` pair, real kernel IP and QUIC stacks, and one complete eight-treatment
+Williams square. It completed eight balanced rotations, 64 accepted rows, and
+640 accepted throughput transfers. Each row contained 60 fresh-connect RTT,
+60 persistent RTT, and 10 throughput samples. Values are medians of the eight
+accepted rotation-level row medians.
 
-| Metric | zuicity (this port) | juicity (Go) | juicity-rs (other) |
-|---|---:|---:|---:|
-| TCP fresh connect+RTT (ms) | **0.96** | 1.15 | 29.0 |
-| TCP persistent RTT (ms) | **0.41** | 0.60 | 0.49 |
-| TCP throughput (Mbps) | **621** | 353 | 8.6 |
-| UDP RTT (ms) | **10.35** | 10.35 | 29.2 |
+| Implementation | Effective GSO | Throughput (Mbps) | Connect RTT (ms) | Persistent RTT (ms) | Combined HWM (KiB) |
+|---|---|---:|---:|---:|---:|
+| **Zuicity v0.4.0** | full on | **1278.97** | **0.790** | **0.374** | **16,974** |
+| Stock Go v0.5.0 | shipping client-off/server-on | 721.44 | 0.845 | 0.513 | 38,464 |
+| Repaired Go v0.5.0 | full on | 986.70 | 0.880 | 0.517 | 38,528 |
+| Latest juicity-rs | Quinn default on | 25.98 | 30.936 | 2.709 | 42,598 |
+| **Zuicity v0.4.0** | native off | **737.47** | **0.890** | **0.403** | **16,652** |
+| Stock Go v0.5.0 | native off | 601.83 | 0.929 | 0.517 | 38,396 |
+| Repaired Go v0.5.0 | native off | 598.31 | 0.890 | 0.510 | 38,080 |
+| Latest juicity-rs | externally controlled off | 5.67 | 28.906 | 1.732 | 29,086 |
 
-![benchmark chart](./docs/benchmarks/benchmark-chart.png)
+![Zuicity v0.4.0 matched four-product benchmark](./docs/benchmarks/benchmark-chart.png)
 
-### Real-Internet WAN (US client to KR server, ~129 ms RTT)
+Against stock Go, Zuicity's paired throughput change was +74.03% with GSO on
+(7-1, exact one-sided sign-test p=0.0352) and +26.35% with GSO off (5-3,
+p=0.3633). Against repaired Go it was +19.69% on (7-1, p=0.0352) and +18.83%
+off (6-2, p=0.1445). With eight rotations, the GSO-on Go comparisons met the
+0.05 threshold; the GSO-off comparisons did not.
+
+The common throughput payload was reduced to 512 KiB for every implementation
+because latest `juicity-rs` timed out on one 4 MiB transfer after 120 seconds,
+despite 141 successful `UDP_SEGMENT` sends. This is therefore a complete,
+balanced common-workload comparison, not the canonical 4 MiB campaign. All
+eight GSO probes passed. One `juicity-rs` GSO-on warmup timed out and was
+retained; its retry passed. Its throughput was also highly variable, with row
+CVs of 155.85% on and 136.96% off. Upstream HEAD and the latest release were
+both `v0.1.0.beta.8` at commit `33caa0f`; the official x86-64-v3 binaries were
+used.
+
+### Historical Real-Internet WAN (US client to KR server, ~129 ms RTT)
 
 A live cross-region benchmark over the public Internet between a US client and a
 KR server (~129 ms base round-trip), average of 5 runs against an upstream Go
@@ -72,13 +96,16 @@ Over the real WAN, zuicity matches or beats Go on fresh connect, throughput, and
 UDP latency, while using about **64% less server memory** (~13 MB vs ~37 MB). The
 test fleet is two US servers and one KR server.
 
-Full data, the spreadsheet, and a one-command reproduction harness live in
+The qualified four-product result, chart sources, historical data, and current
+manifest-driven release harness live in
 [`docs/benchmarks`](./docs/benchmarks) and
 [`scripts/benchmark`](./scripts/benchmark):
 
-- `docs/benchmarks/benchmark-comparison.xlsx` - the comparison spreadsheet (performance + memory)
-- `docs/benchmarks/benchmark-chart.svg` / `.png` - the chart
-- `scripts/benchmark/run-comparison.sh` - reproduce the whole comparison
+- `docs/benchmarks/v0.4.0-four-product-512k.md` - methodology, hashes, comparisons, and limitations
+- `docs/benchmarks/benchmark-chart.svg` / `.png` / `.md` - the current matched-campaign chart and table
+- `scripts/benchmark/run-comparison.sh` - run a hash-pinned TCP GSO campaign
+- `scripts/benchmark/tcp-gso-v040-go-jrs.example.json` - exact four-product artifacts and mode controls
+- `docs/benchmarks/benchmark-comparison.xlsx`, `results.jsonl`, and `memory.jsonl` - retired historical data
 
 > The `veth` numbers are from a single-host bench for relative comparison under
 > identical kernel/host conditions; the WAN numbers are from a real cross-region
@@ -185,15 +212,33 @@ juicity server):
 ## Reproduce the benchmark
 
 ```bash
-sudo scripts/benchmark/run-comparison.sh \
-  --rust-dir  <dir with zuicity-client/zuicity-server> \
-  --go-dir    <dir> \
-  --other-dir <dir> \
-  --reps 5 --iters 60
+export CANDIDATE_BIN_DIR=<candidate build directory>
+export GO_STOCK_BIN_DIR=<stock Go v0.5.0 directory>
+export GO_REPAIRED_BIN_DIR=<repaired Go directory>
+export JUICITY_RS_BIN_DIR=<official juicity-rs x86-64-v3 directory>
+export JUICITY_RS_GSO_SHIM=<hash-pinned GSO-off preload path>
+
+sudo --preserve-env=CANDIDATE_BIN_DIR,GO_STOCK_BIN_DIR,GO_REPAIRED_BIN_DIR,JUICITY_RS_BIN_DIR,JUICITY_RS_GSO_SHIM \
+  scripts/benchmark/run-comparison.sh \
+  --manifest scripts/benchmark/tcp-gso-v040-go-jrs.example.json \
+  --out-dir benchmark-results/v040-go-jrs-common-512k \
+  --profile standard \
+  --rtt-samples 60 \
+  --throughput-samples 10 \
+  --throughput-bytes 524288 \
+  --warmup-transfers 2 \
+  --max-row-attempts 5 \
+  --server-cpus <reviewed server CPUs> \
+  --client-cpus <reviewed client CPUs> \
+  --driver-cpus <reviewed driver CPU> \
+  --echo-cpus <reviewed echo CPU>
 ```
 
-See [`scripts/benchmark/README.md`](./scripts/benchmark/README.md) for the full
-build/fetch/run/chart workflow.
+If the local `sudo` policy disallows `--preserve-env`, pass the paths through an
+approved root environment instead. See
+[`scripts/benchmark/README.md`](./scripts/benchmark/README.md) for hash
+validation, profiles, GSO probes, statistical rules, output layout, and the
+historical `h156` versus released-v0.3.0 provenance correction.
 
 ## Related projects
 

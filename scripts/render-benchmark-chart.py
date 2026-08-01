@@ -1,174 +1,216 @@
 #!/usr/bin/env python3
-"""Render a benchmark comparison chart from three-way results.jsonl.
+"""Render the matched four-product benchmark chart from summary.json.
 
-Zero third-party dependencies: emits a standalone SVG (renders in any browse
-and on GitHub) plus a Markdown summary. Input is the results.jsonl produced by
-the two-namespace benchmark harness (one JSON object per implementation run).
+Zero third-party dependencies: emits a standalone SVG plus a Markdown summary.
+Input is the summary.json produced by scripts/benchmark/tcp_gso_suite.py.
 
 Usage:
-  python3 scripts/render-benchmark-chart.py <results.jsonl> [--out-dir DIR] \
-      [--title TITLE]
-
-Metrics charted (median of per-run medians):
-  - TCP connect+RTT (ms, lower is better)
-  - TCP persistent RTT (ms, lower is better)
-  - TCP throughput (Mbps, higher is better)
-  - UDP RTT (ms, lower is better)
+  python3 scripts/render-benchmark-chart.py <summary.json> [--out-dir DIR] \
+       [--title TITLE]
 """
 import argparse
 import json
-import statistics
-import sys
 from pathlib import Path
 
-# tag -> display label; order defines bar orde
 LABELS = [
-    ("rust", "zuicity (this port)"),
-    ("go", "juicity (Go upstream)"),
-    ("juicityrs", "juicity-rs (other)"),
+    ("candidate", ("Zuicity", "v0.4.0")),
+    ("go-stock", ("Stock Go", "v0.5.0")),
+    ("go-repaired", ("Repaired Go", "v0.5.0")),
+    ("juicity-rs", ("juicity-rs", "beta.8")),
 ]
-COLORS = {"rust": "#2f6f4f", "go": "#3060a8", "juicityrs": "#9a5b2e"}
+COLORS = {
+    "candidate": "#147d64",
+    "go-stock": "#386cb0",
+    "go-repaired": "#d28b26",
+    "juicity-rs": "#b44d3a",
+}
 
 METRICS = [
-    ("tcp_connect_rtt", "median_ms", "TCP connect+RTT (ms)", "lower"),
-    ("tcp_persistent_rtt", "median_ms", "TCP persistent RTT (ms)", "lower"),
-    ("tcp_throughput_mbps", "median", "TCP throughput (Mbps)", "higher"),
-    ("udp_rtt", "median_ms", "UDP RTT (ms)", "lower"),
+    ("on", "tcp_connect_rtt_ms", "TCP connect + RTT", "GSO on, ms", "lower"),
+    ("on", "tcp_persistent_rtt_ms", "TCP persistent RTT", "GSO on, ms", "lower"),
+    ("on", "tcp_throughput_mbps", "TCP throughput", "GSO on, 512 KiB echo", "higher"),
+    ("off", "tcp_throughput_mbps", "TCP throughput", "GSO off, 512 KiB echo", "higher"),
 ]
 
 
-def load_medians(jsonl_path):
-    rows = [json.loads(l) for l in Path(jsonl_path).read_text().splitlines() if l.strip()]
-    out = {}
+def load_summary(summary_path):
+    summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    arms = summary["arms"]
+    medians = {}
     for tag, _ in LABELS:
-        out[tag] = {}
-        for metric, field, _t, _dir in METRICS:
-            vals = []
-            for r in rows:
-                if r.get("tag") != tag:
-                    continue
-                item = r.get(metric)
-                if item and item.get(field) is not None:
-                    vals.append(float(item[field]))
-            out[tag][metric] = statistics.median(vals) if vals else None
-    return out, len(rows)
+        medians[tag] = {}
+        for mode in ("on", "off"):
+            for metric in (
+                "tcp_connect_rtt_ms",
+                "tcp_persistent_rtt_ms",
+                "tcp_throughput_mbps",
+            ):
+                medians[tag][(mode, metric)] = float(
+                    arms[tag][mode]["metrics"][metric]["median"]
+                )
+    rotations = int(
+        arms["candidate"]["on"]["metrics"]["tcp_throughput_mbps"][
+            "n_rotation_rows"
+        ]
+    )
+    return medians, rotations
 
 
-def esc(s):
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
+def esc(value):
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
-def panel_svg(x0, y0, w, h, title, direction, data):
-    # data: list of (tag, label, value-or-None)
-    vals = [v for _, _, v in data if v is not None]
-    vmax = max(vals) if vals else 1.0
-    if vmax <= 0:
-        vmax = 1.0
-    pad_top, pad_bottom, pad_left = 44, 58, 8
+def format_value(metric, value):
+    if metric == "tcp_throughput_mbps":
+        return f"{value:,.2f}"
+    return f"{value:.3f}"
+
+
+def panel_svg(x0, y0, w, h, title, context, direction, metric, data):
+    vmax = max(value for _, _, value in data)
+    pad_top, pad_bottom, pad_left = 62, 62, 12
     plot_h = h - pad_top - pad_bottom
     plot_w = w - 2 * pad_left
     n = len(data)
     slot = plot_w / n
-    bar_w = slot * 0.56
+    bar_w = min(78, slot * 0.58)
     parts = []
     better = "lower is better" if direction == "lower" else "higher is better"
-    parts.append(f'<text x="{x0 + w/2:.1f}" y="{y0+18:.1f}" text-anchor="middle" '
-                 f'font-size="15" font-weight="700" fill="#1b1b1b">{esc(title)}</text>')
-    parts.append(f'<text x="{x0 + w/2:.1f}" y="{y0+31:.1f}" text-anchor="middle" '
-                 f'font-size="10" fill="#777">{better}</text>')
+    parts.append(
+        f'<text x="{x0 + w / 2:.1f}" y="{y0 + 23:.1f}" text-anchor="middle" '
+        f'font-size="20" font-weight="700" fill="#15181b">{esc(title)}</text>'
+    )
+    parts.append(
+        f'<text x="{x0 + w / 2:.1f}" y="{y0 + 43:.1f}" text-anchor="middle" '
+        f'font-size="12" fill="#697077">{esc(context)} | {better}</text>'
+    )
     base_y = y0 + pad_top + plot_h
-    parts.append(f'<line x1="{x0+pad_left:.1f}" y1="{base_y:.1f}" '
-                 f'x2="{x0+pad_left+plot_w:.1f}" y2="{base_y:.1f}" stroke="#ccc" stroke-width="1"/>')
+    parts.append(
+        f'<line x1="{x0 + pad_left:.1f}" y1="{base_y:.1f}" '
+        f'x2="{x0 + pad_left + plot_w:.1f}" y2="{base_y:.1f}" '
+        'stroke="#c7ccd1" stroke-width="1.5"/>'
+    )
     for i, (tag, label, v) in enumerate(data):
         cx = x0 + pad_left + slot * i + slot / 2
-        if v is None:
-            parts.append(f'<text x="{cx:.1f}" y="{base_y-6:.1f}" text-anchor="middle" '
-                         f'font-size="11" fill="#b00">n/a</text>')
-            bh = 0
-        else:
-            bh = (v / vmax) * plot_h
-            by = base_y - bh
-            parts.append(f'<rect x="{cx-bar_w/2:.1f}" y="{by:.1f}" width="{bar_w:.1f}" '
-                         f'height="{bh:.1f}" rx="3" fill="{COLORS.get(tag,"#888")}"/>')
-            label_v = f"{v:.2f}" if v < 100 else f"{v:.0f}"
-            parts.append(f'<text x="{cx:.1f}" y="{by-5:.1f}" text-anchor="middle" '
-                         f'font-size="11" font-weight="600" fill="#222">{label_v}</text>')
-        # wrap label over up to 2 lines
-        words = label.split(" ")
-        mid = (len(words) + 1) // 2
-        l1 = " ".join(words[:mid])
-        l2 = " ".join(words[mid:])
-        parts.append(f'<text x="{cx:.1f}" y="{base_y+16:.1f}" text-anchor="middle" '
-                     f'font-size="10" fill="#333">{esc(l1)}</text>')
-        if l2:
-            parts.append(f'<text x="{cx:.1f}" y="{base_y+28:.1f}" text-anchor="middle" '
-                         f'font-size="10" fill="#333">{esc(l2)}</text>')
+        bh = max(2.5, (v / vmax) * plot_h)
+        by = base_y - bh
+        parts.append(
+            f'<rect x="{cx - bar_w / 2:.1f}" y="{by:.1f}" width="{bar_w:.1f}" '
+            f'height="{bh:.1f}" rx="4" fill="{COLORS[tag]}"/>'
+        )
+        parts.append(
+            f'<text x="{cx:.1f}" y="{max(y0 + 56, by - 8):.1f}" text-anchor="middle" '
+            f'font-size="13" font-weight="700" fill="#202428">'
+            f'{esc(format_value(metric, v))}</text>'
+        )
+        parts.append(
+            f'<text x="{cx:.1f}" y="{base_y + 20:.1f}" text-anchor="middle" '
+            f'font-size="12" font-weight="600" fill="#30363b">{esc(label[0])}</text>'
+        )
+        parts.append(
+            f'<text x="{cx:.1f}" y="{base_y + 37:.1f}" text-anchor="middle" '
+            f'font-size="11" fill="#697077">{esc(label[1])}</text>'
+        )
     return "\n".join(parts)
 
 
-def render_svg(medians, title, run_count, subtitle=None):
+def render_svg(medians, title, rotations, subtitle=None):
     cols, rows = 2, 2
-    pw, ph = 380, 240
-    margin_x, margin_top, margin_bottom = 20, 56, 30
-    W = margin_x * 2 + cols * pw
-    H = margin_top + rows * ph + margin_bottom
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
-           f'viewBox="0 0 {W} {H}" font-family="DejaVu Sans, Arial, sans-serif">']
+    pw, ph = 570, 315
+    margin_x, gap_x, margin_top = 25, 10, 112
+    W, H = 1200, 850
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'viewBox="0 0 {W} {H}" font-family="Arial, Helvetica, sans-serif">'
+    ]
     out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-    out.append(f'<text x="{W/2:.1f}" y="26" text-anchor="middle" font-size="20" '
-               f'font-weight="700" fill="#111">{esc(title)}</text>')
-    sub = subtitle or f"two-namespace veth benchmark, median of {run_count // 3} reps"
-    out.append(f'<text x="{W/2:.1f}" y="44" text-anchor="middle" font-size="11" '
-               f'fill="#666">{esc(sub)} (lower RTT / higher throughput = better)</text>')
-    for idx, (metric, field, mtitle, direction) in enumerate(METRICS):
+    out.append(
+        f'<text x="{W / 2:.1f}" y="38" text-anchor="middle" font-size="28" '
+        f'font-weight="700" fill="#101315">{esc(title)}</text>'
+    )
+    sub = subtitle or (
+        f"two-namespace veth | {rotations} balanced rotations | "
+        "median of rotation-level row medians"
+    )
+    out.append(
+        f'<text x="{W / 2:.1f}" y="65" text-anchor="middle" font-size="14" '
+        f'fill="#586069">{esc(sub)}</text>'
+    )
+    out.append(
+        f'<text x="{W / 2:.1f}" y="86" text-anchor="middle" font-size="13" '
+        f'fill="#697077">64 accepted rows | 60/60/10 samples per row | 640 accepted transfers</text>'
+    )
+    for idx, (mode, metric, mtitle, context, direction) in enumerate(METRICS):
         r, c = divmod(idx, cols)
-        x0 = margin_x + c * pw
+        x0 = margin_x + c * (pw + gap_x)
         y0 = margin_top + r * ph
-        data = [(tag, label, medians[tag][metric]) for tag, label in LABELS]
-        out.append(panel_svg(x0, y0, pw, ph, mtitle, direction, data))
+        data = [(tag, label, medians[tag][(mode, metric)]) for tag, label in LABELS]
+        out.append(panel_svg(x0, y0, pw, ph, mtitle, context, direction, metric, data))
+    out.append(
+        f'<text x="{W / 2:.1f}" y="805" text-anchor="middle" font-size="13" '
+        f'fill="#4f575e">Common 512 KiB workload; not the canonical 4 MiB campaign.</text>'
+    )
+    out.append(
+        f'<text x="{W / 2:.1f}" y="827" text-anchor="middle" font-size="12" '
+        f'fill="#697077">juicity-rs throughput CV: 155.85% on / 136.96% off; '
+        f'stock Go on uses shipping client-off/server-on behavior.</text>'
+    )
     out.append("</svg>")
     return "\n".join(out)
 
 
-def render_markdown(medians, title, run_count, subtitle=None):
-    sub = subtitle or "Two-namespace veth benchmark"
-    lines = [f"# {title}", "",
-             f"{sub}, median of {run_count // 3} reps per implementation.",
-             "", "| Implementation | TCP connect+RTT (ms) | TCP persistent RTT (ms) | "
-             "TCP throughput (Mbps) | UDP RTT (ms) |",
-             "|---|---:|---:|---:|---:|"]
-
-    def fmt(v):
-        if v is None:
-            return "n/a"
-        return f"{v:.3f}" if v < 100 else f"{v:.1f}"
-    for tag, label in LABELS:
-        m = medians[tag]
-        lines.append(f"| {label} | {fmt(m['tcp_connect_rtt'])} | {fmt(m['tcp_persistent_rtt'])} "
-                     f"| {fmt(m['tcp_throughput_mbps'])} | {fmt(m['udp_rtt'])} |")
-    lines.append("")
-    lines.append("Lower is better for RTT metrics; higher is better for throughput.")
-    lines.append("")
+def render_markdown(medians, title, rotations, subtitle=None):
+    sub = subtitle or "Two-namespace veth matched four-product benchmark"
+    lines = [
+        f"# {title}",
+        "",
+        f"{sub}; median of {rotations} accepted rotation-level row medians.",
+        "",
+        "| Implementation | GSO | TCP connect+RTT (ms) | TCP persistent RTT (ms) | TCP throughput (Mbps) |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for mode in ("on", "off"):
+        for tag, label in LABELS:
+            lines.append(
+                f"| {' '.join(label)} | {mode} | "
+                f"{medians[tag][(mode, 'tcp_connect_rtt_ms')]:.3f} | "
+                f"{medians[tag][(mode, 'tcp_persistent_rtt_ms')]:.3f} | "
+                f"{medians[tag][(mode, 'tcp_throughput_mbps')]:.2f} |"
+            )
+    lines.extend(
+        [
+            "",
+            "Lower is better for RTT; higher is better for throughput.",
+            "",
+            "The common throughput payload was 512 KiB, not the canonical 4 MiB.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("jsonl")
+    ap.add_argument("summary_json")
     ap.add_argument("--out-dir", default=".")
-    ap.add_argument("--title", default="zuicity QUIC proxy performance")
+    ap.add_argument("--title", default="Zuicity v0.4.0: matched four-product benchmark")
     ap.add_argument("--subtitle", default=None)
     args = ap.parse_args()
 
-    medians, run_count = load_medians(args.jsonl)
+    medians, rotations = load_summary(args.summary_json)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    svg = render_svg(medians, args.title, run_count, args.subtitle)
-    md = render_markdown(medians, args.title, run_count, args.subtitle)
-    (out_dir / "benchmark-chart.svg").write_text(svg)
-    (out_dir / "benchmark-chart.md").write_text(md)
+    svg = render_svg(medians, args.title, rotations, args.subtitle)
+    md = render_markdown(medians, args.title, rotations, args.subtitle)
+    (out_dir / "benchmark-chart.svg").write_bytes(svg.encode("utf-8"))
+    (out_dir / "benchmark-chart.md").write_bytes(md.encode("utf-8"))
     print(f"wrote {out_dir/'benchmark-chart.svg'}")
     print(f"wrote {out_dir/'benchmark-chart.md'}")
     print(md)
