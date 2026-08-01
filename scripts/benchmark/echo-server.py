@@ -12,6 +12,7 @@ udp_port = int(sys.argv[3])
 
 def _handle(conn):
     with conn:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         while True:
             data = conn.recv(65536)
             if not data:

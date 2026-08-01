@@ -1,122 +1,232 @@
-# zuicity three-way performance benchmark
+# TCP GSO release benchmark
 
-Reproducible comparison of three juicity implementations over a real
-cross-host path:
+This directory contains the canonical local release-comparison suite. It runs
+real TCP forwarding through Juicity client/server pairs in two Linux network
+namespaces connected by a `veth` pair. Traffic crosses the kernel IP and QUIC
+stacks; it is not a loopback microbenchmark.
 
-| Implementation | What it is |
-|---|---|
-| `zuicity` (this repo) | The Rust port being developed here |
-| `juicity` (Go) | Upstream Go juicity (`github.com/juicity/juicity`) |
-| `juicity-rs` (other) | The separate Rust reimplementation (`github.com/juicity/juicity-rs`) |
+The release-lineage example manifest compares these four implementations with
+both GSO-on and GSO-off treatments:
 
-The benchmark runs each implementation's client and server in two separate
-Linux network namespaces joined by a `veth` pair, so traffic crosses a real
-IP stack and real QUIC — not loopback. It measures four metrics (median of N
-repetitions, implementation order rotated to cancel ordering bias):
+| ID | Artifact |
+| --- | --- |
+| `candidate` | v0.4.0 candidate under review |
+| `v030` | released v0.3.0 package |
+| `v040-prior` | previous accepted v0.4.0 package |
+| `go-repaired` | pinned Juicity Go v0.5.0 package with the full GSO repair |
 
-- TCP connect+RTT (fresh connection + 64-byte echo), ms, lower is better
-- TCP persistent RTT (64-byte echo on a kept-open connection), ms, lower is better
-- TCP throughput (4 MiB echo transfer), Mbps, higher is better
-- UDP RTT (64-byte datagram echo), ms, lower is better
+`tcp-gso-v040-go-jrs.example.json` provides the product comparison across the
+current candidate, stock Go, repaired Go, and the latest official
+`github.com/juicity/juicity-rs` release. Its stock-Go on treatment uses shipping
+client-off/server-on behavior. Because `juicity-rs` has no GSO-off runtime
+switch, its off treatment uses a hash-pinned preload control that denies Quinn's
+`UDP_SEGMENT` capability probe while leaving the release binaries unchanged.
+
+The manifest, not a directory label, defines artifact identity. Every client and
+server has a required SHA256, and execution stops before timing if any hash does
+not match.
+
+## Suite files
+
+- `tcp_gso_suite.py` validates manifests, builds schedules, runs campaigns, and
+  summarizes accepted rotation rows.
+- `run-comparison.sh` is the canonical wrapper for `tcp_gso_suite.py run`.
+- `bench-one-tcp.sh` is the internal namespace and process-accounting harness.
+- `tcp-driver.py` generates fresh-connect RTT, persistent RTT, and TCP echo
+  throughput samples with `TCP_NODELAY`.
+- `echo-server.py` provides the isolated target service.
+- `tcp-gso-v040-candidate.example.json` pins the current eight binaries and mode
+  controls.
+- `tcp-gso-v040-go-jrs.example.json` pins the requested four-product comparison,
+  including the latest official `juicity-rs` artifacts and GSO-off control.
+- `test_tcp_gso_suite.py` covers manifest validation, scheduling, trace parsing,
+  and rotation-level inference.
+
+The current `benchmark-chart.svg`, `.png`, and `.md` under `docs/benchmarks/`
+were rendered from the qualified four-product suite summary. The spreadsheet,
+`results.jsonl`, and `memory.jsonl` in that directory are historical products of
+the retired three-way harness and must not be relabeled as v0.3.0/v0.4.0 release
+evidence.
 
 ## Requirements
 
-- Linux with `CAP_NET_ADMIN` (run as root; it creates network namespaces)
-- `python3`, `openssl`, `iproute2` (`ip`)
-- A Rust toolchain (to build this port) and a Go toolchain (to build upstream)
-- `unzip`, `curl` (to fetch the other juicity-rs release)
+- Linux, root privileges, and network namespace support.
+- `bash`, `python3`, `iproute2`, `openssl`, `timeout`, and `strace`.
+- `taskset` from util-linux when `--cpus` is used. Standard and release profiles
+  require CPU affinity.
+- Prebuilt executable client/server artifacts matching every manifest hash.
+- An unused output path. The suite refuses to overwrite an existing directory.
 
-Works on any modern Linux host.
+The suite checks for stale `zuicity-bench-*` namespaces and fails closed rather
+than deleting unexplained state.
 
-## 1. Build / fetch the three implementations
+## Prepare and validate
 
-```bash
-# (a) This Rust port
-cargo build --release --bin zuicity-client --bin zuicity-server
-mkdir -p /tmp/jbench/rust
-cp target/release/zuicity-client target/release/zuicity-server /tmp/jbench/rust/
-
-# (b) Upstream Go juicity
-git clone https://github.com/juicity/juicity /tmp/juicity-go-src
-mkdir -p /tmp/jbench/go
-( cd /tmp/juicity-go-src
-  go build -o /tmp/jbench/go/juicity-server ./cmd/server
-  go build -o /tmp/jbench/go/juicity-client ./cmd/client )
-
-# (c) The other juicity-rs (latest release, x86_64 musl)
-mkdir -p /tmp/jbench/other && cd /tmp/jbench/other
-curl -fSL \
-  https://github.com/juicity/juicity-rs/releases/latest/download/juicity-x86_64-unknown-linux-musl.zip \
-  -o juicity-rs.zip
-unzip -o juicity-rs.zip
-chmod +x juicity-client juicity-server
-```
-
-> Tip: the rust dir must contain binaries named exactly `zuicity-client` and
-> `zuicity-server`, while the Go and other-rs dirs must contain `juicity-client`
-> and `juicity-server`. To pin a specific juicity-rs release instead of `latest`,
-> replace `latest/download` with `download/<tag>` (e.g. `download/v0.1.0.beta.3`).
-
-## 2. Run the comparison
+Set the four artifact directories referenced by the example manifest:
 
 ```bash
-sudo scripts/benchmark/run-comparison.sh \
-  --rust-dir  /tmp/jbench/rust \
-  --go-dir    /tmp/jbench/go \
-  --other-dir /tmp/jbench/other \
-  --reps 5 --iters 60
+export CANDIDATE_BIN_DIR=/path/to/candidate/build
+export V030_BIN_DIR=/path/to/released-v0.3.0/build
+export V040_PRIOR_BIN_DIR=/path/to/prior-v0.4.0/build
+export GO_REPAIRED_BIN_DIR=/path/to/repaired-go
+
+python3 scripts/benchmark/tcp_gso_suite.py validate \
+  --manifest scripts/benchmark/tcp-gso-v040-candidate.example.json
 ```
 
-Output lands in `benchmark-results/<timestamp>/`:
-
-- `results.jsonl` - one JSON object per implementation run (raw metrics)
-- `benchmark-chart.svg` - the comparison chart (renders in any browser / GitHub)
-- `benchmark-chart.png` - PNG version (if `rsvg-convert`/`inkscape`/`convert` is present)
-- `benchmark-chart.md` - a Markdown summary table
-
-## 3. Re-render the chart from existing data
-
-If you already have a `results.jsonl`, regenerate the chart without re-running
-the benchmark:
+When privilege elevation is needed, preserve only those path variables:
 
 ```bash
-python3 scripts/render-benchmark-chart.py <path>/results.jsonl \
-  --out-dir <path> \
-  --title "zuicity QUIC proxy: performance comparison"
+sudo --preserve-env=CANDIDATE_BIN_DIR,V030_BIN_DIR,V040_PRIOR_BIN_DIR,GO_REPAIRED_BIN_DIR \
+  scripts/benchmark/run-comparison.sh \
+  --manifest scripts/benchmark/tcp-gso-v040-candidate.example.json \
+  --out-dir benchmark-results/tcp-gso-$(date -u +%Y%m%dT%H%M%SZ) \
+  --profile standard \
+  --cpus 2-5
 ```
 
-The chart renderer is pure Python (standard library only) and always writes an
-SVG + Markdown; a PNG is produced if an SVG converter is installed.
+Use a CPU set suitable for the host. Do not reuse `2-5` without confirming its
+topology and availability.
 
-## 4. Excel spreadsheet (performance + memory)
-
-`docs/benchmarks/benchmark-comparison.xlsx` is a formatted spreadsheet that
-combines the four performance metrics with memory usage (peak and idle resident
-set size for client and server) for all three implementations.
-
-To regenerate it you need `results.jsonl` (performance) and `memory.jsonl`
-(memory), plus the `openpyxl` library (`apt-get install python3-openpyxl` or
-`pip install openpyxl`):
+To inspect the schedule without executing binaries:
 
 ```bash
-python3 scripts/render-benchmark-xlsx.py \
-  --results docs/benchmarks/results.jsonl \
-  --memory  docs/benchmarks/memory.jsonl \
-  --out     docs/benchmarks/benchmark-comparison.xlsx
+python3 scripts/benchmark/tcp_gso_suite.py schedule \
+  --manifest scripts/benchmark/tcp-gso-v040-candidate.example.json \
+  --blocks 1
 ```
 
-`memory.jsonl` is produced by running each implementation under sustained TCP
-load while sampling its client and server RSS. Each line is one JSON object:
-`{tag, client_peak_rss_kb, server_peak_rss_kb, client_idle_rss_kb,
-server_idle_rss_kb}`.
+## Profiles
 
-## Notes on interpretation
+| Profile | Rotations | Rows | RTT samples/row | Throughput samples/row | Payload | Warmups | Canonical |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `smoke` | 1 | 8 | 2 | 3 | 1 MiB | 1 | No, incomplete square |
+| `standard` | 8 | 64 | 60 | 100 | 4 MiB | 5 | Yes, one Williams block |
+| `release` | 16 | 128 | 60 | 100 | 4 MiB | 5 | Yes, two blocks |
 
-- This is a single-host `veth` benchmark. Absolute numbers differ on physical
-  NICs and over the Internet; it is meant for relative comparison under
-  identical kernel/host conditions.
-- UDP RTT is dominated by the per-peer UDP-over-stream setup that all juicity
-  implementations pay (the driver uses a fresh local source port per datagram),
-  so equal UDP RTT between two implementations is expected.
-- All three implementations share the same `run -c <config.json>` CLI and the
-  same config schema, which is what makes the single harness able to drive them.
+The eight treatments are scheduled as an even-treatment Williams square. One
+complete block balances treatment position and first-order carryover. The second
+release block traverses the rotations in reverse order. `smoke` exists only to
+verify execution, probes, cleanup, and output shape; its performance numbers are
+not ranking evidence.
+
+Explicit sample/profile overrides are useful for development, but an overridden
+campaign must describe those changes and should not be represented as the
+standard or release protocol.
+
+## GSO verification
+
+Before measured rows, the suite runs one traced probe for every implementation
+and mode. The probes use `strace` on `sendmsg`/`sendmmsg`; measured rows are not
+traced.
+
+Probe traffic is deliberately small and is not a workload qualification. A mode
+may explicitly accept a driver error after the required syscall evidence is
+captured; this is used for latest `juicity-rs`, whose packet path becomes
+pathologically slow under `strace`. Its untraced workload must still pass the
+full measured-row contract, and any failure is retained and retried normally.
+
+- GSO-on requires at least one successful `UDP_SEGMENT` send.
+- GSO-off requires zero `UDP_SEGMENT` attempts.
+- The parser recognizes both symbolic `UDP_SEGMENT` and the Linux numeric control
+  message type `0x67`/`103` under `SOL_UDP` or `IPPROTO_UDP`.
+- Any failed probe, driver error, hash mismatch, or malformed result stops the
+  campaign.
+
+The pinned controls are:
+
+| Family | GSO on | GSO off |
+| --- | --- | --- |
+| Rust | `ZUICITY_ENABLE_GSO=1`; unset `ZUICITY_DISABLE_GSO` | `ZUICITY_DISABLE_GSO=1`; unset `ZUICITY_ENABLE_GSO` |
+| Go | `QUIC_GO_DISABLE_GSO=` | `QUIC_GO_DISABLE_GSO=true` |
+| `juicity-rs` | Unmodified Quinn default | Unmodified release binary plus hash-pinned external `UDP_SEGMENT` capability denial |
+
+## Statistical contract
+
+The inference unit is one accepted rotation-level row median. Transfer samples
+within a row are retained as raw evidence but are never treated as independent
+replicates. Comparisons pair the reference and comparator rows from the same
+rotation and GSO mode. Reports include paired median percent changes,
+wins/losses/ties, and an exact one-sided sign test.
+
+Host gates cover pre-row CPU activity, background CPU activity, frequency ratio,
+and temperature when the host exposes those monitors. A rejected row is retained
+in `rejected.jsonl` and retried up to `--max-row-attempts`. Monitor availability
+is part of the summary and must be disclosed; missing telemetry is not silently
+invented.
+
+## Output
+
+Each campaign creates:
+
+```text
+<out-dir>/
+  captures/<row-tag>/
+  meta/binaries.sha256
+  meta/harness.sha256
+  meta/host.json
+  meta/method.json
+  meta/resolved-manifest.json
+  meta/schedule.json
+  meta/versions/
+  probes.jsonl
+  rejected.jsonl
+  results.jsonl
+  summary.json
+  summary.md
+```
+
+Raw probe traces can be large. Inspect file sizes before opening them and prefer
+the bounded `probes.jsonl`, `summary.json`, and `summary.md` records first.
+
+## Historical provenance
+
+The remembered no-GSO result of 731.27 versus 660.86 Mbps was an `h156`
+development artifact, not released v0.3.0. It also used a different Go client
+from the repaired-Go package. The shared Go server hash does not make the client
+pair equivalent.
+
+| Artifact | Client SHA256 | Server SHA256 |
+| --- | --- | --- |
+| `h156` development build | `54a3d58247d2af84b8238b8b58f1e300a649b62dd3e67f838a77ceae79027e` | `42409a818639e38d56167a5a2edd1571ff81fe59782395031a606c467674262e` |
+| Historical Go comparator | `a98d80d659cf4c7cbd1b8cca0c977f84d0ab1251194421714a6877cd5744abbf` | `f5af206e9f49c00ec7399da39da49a861c0b4081716604b7fd8c379304780198` |
+| Released v0.3.0 | `c4abab90572efdbf825192ed35fbf4591d54cb854a14964b00c45a2517588f48` | `a6641746add705dd27ac6d8dc19663baf7582743234a3e2f37054ccb97be19b8` |
+| Repaired Go | `995c20ddc6a10e9bf6e589bb09538c5692029ac4748cd4bcf684e4732091fafb` | `f5af206e9f49c00ec7399da39da49a861c0b4081716604b7fd8c379304780198` |
+| Prior v0.4.0 | `3d749a927d6ee0c6d4f7a4af917554ccacf364a12a95e02f23ea2b7ba562d3ba` | `600e93e3b3ddffb19513abbb65fd9882ec8267e85a729956fcf74e1117d20c4a` |
+| Current candidate | `079c7716959a2d05a02de74af4dddbb7df44fa18e5a9e04edff8ddc7ed75e3e7` | `cec42e54cd06e6861894352b635e22d04f08f2693cdb395f9649be426658b5a1` |
+
+| Campaign | Rust artifact | Go artifact | GSO | Rust median | Go median | Result |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| 2026-07-26 historical run | `h156` | historical Go | off | 731.27 Mbps | 660.86 Mbps | `h156` +10.654% |
+| 2026-07-28 contemporaneous run | released v0.3.0 | repaired Go | off | 202.335 Mbps | 288.74 Mbps | v0.3.0 lost |
+| 2026-07-28 repeat | released v0.3.0 | repaired Go | off | 193.095 Mbps | 267.62 Mbps | v0.3.0 lost |
+| 2026-07-30 four-arm predecessor | released v0.3.0 | repaired Go | off | 137.76 Mbps | 449.98 Mbps | v0.3.0 lost |
+
+The 2026-07-26 method used 60 fresh-connect samples, 60 persistent samples, 10
+throughput samples, and a 4 MiB send-plus-full-echo operation per row with
+transmit GSO forced off. Its result is valid for those exact hashes and method,
+but it cannot support a claim about released v0.3.0.
+
+The 2026-07-30 four-arm predecessor additionally reported these row medians:
+
+| Mode | Candidate | Prior v0.4.0 | Repaired Go | Released v0.3.0 |
+| --- | ---: | ---: | ---: | ---: |
+| GSO on | 1378.505 | 862.455 | 728.51 | 490.02 |
+| GSO off | 725.50 | 600.79 | 449.98 | 137.76 |
+
+Those predecessor campaigns are retained as historical evidence, not as output
+from the canonical combined-treatment suite. New release claims must use a
+versioned manifest, complete Williams block, strict probes, and accepted
+rotation-level rows.
+
+## Validation
+
+Run the local checks without creating namespaces:
+
+```bash
+python3 -m py_compile \
+  scripts/benchmark/tcp-driver.py \
+  scripts/benchmark/tcp_gso_suite.py
+bash -n scripts/benchmark/bench-one-tcp.sh
+python3 scripts/benchmark/test_tcp_gso_suite.py
+```

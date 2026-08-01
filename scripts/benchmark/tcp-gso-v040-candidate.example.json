@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "suite": "zuicity-v0.4.0-candidate-tcp-gso",
+  "reference": "candidate",
+  "implementations": [
+    {
+      "id": "candidate",
+      "label": "v0.4.0 candidate (reusable relay buffers + tracing callsite filter)",
+      "version": "0.4.0 candidate at 873f64f68f91ed09c9c6864290e55744b8cd23de",
+      "source": "qualified detached candidate package",
+      "family": "rust",
+      "client": {
+        "path": "${CANDIDATE_BIN_DIR}/zuicity-client",
+        "sha256": "079c7716959a2d05a02de74af4dddbb7df44fa18e5a9e04edff8ddc7ed75e3e7"
+      },
+      "server": {
+        "path": "${CANDIDATE_BIN_DIR}/zuicity-server",
+        "sha256": "cec42e54cd06e6861894352b635e22d04f08f2693cdb395f9649be426658b5a1"
+      },
+      "modes": {
+        "on": {
+          "set": {"ZUICITY_ENABLE_GSO": "1"},
+          "unset": ["ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present"
+        },
+        "off": {
+          "set": {"ZUICITY_DISABLE_GSO": "1"},
+          "unset": ["ZUICITY_ENABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "absent"
+        }
+      }
+    },
+    {
+      "id": "v030",
+      "label": "released v0.3.0",
+      "version": "0.3.0 at 74ccf2586a6e803214e36ba4a2fc5d68d422bb88",
+      "source": "contemporaneous release package",
+      "family": "rust",
+      "client": {
+        "path": "${V030_BIN_DIR}/zuicity-client",
+        "sha256": "c4abab90572efdbf825192ed35fbf4591d54cb854a14964b00c45a2517588f48"
+      },
+      "server": {
+        "path": "${V030_BIN_DIR}/zuicity-server",
+        "sha256": "a6641746add705dd27ac6d8dc19663baf7582743234a3e2f37054ccb97be19b8"
+      },
+      "modes": {
+        "on": {
+          "set": {"ZUICITY_ENABLE_GSO": "1"},
+          "unset": ["ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present"
+        },
+        "off": {
+          "set": {"ZUICITY_DISABLE_GSO": "1"},
+          "unset": ["ZUICITY_ENABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "absent"
+        }
+      }
+    },
+    {
+      "id": "v040-prior",
+      "label": "prior v0.4.0 package",
+      "version": "0.4.0 at 873f64f68f91ed09c9c6864290e55744b8cd23de",
+      "source": "previous accepted v0.4.0 package",
+      "family": "rust",
+      "client": {
+        "path": "${V040_PRIOR_BIN_DIR}/zuicity-client",
+        "sha256": "3d749a927d6ee0c6d4f7a4af917554ccacf364a12a95e02f23ea2b7ba562d3ba"
+      },
+      "server": {
+        "path": "${V040_PRIOR_BIN_DIR}/zuicity-server",
+        "sha256": "600e93e3b3ddffb19513abbb65fd9882ec8267e85a729956fcf74e1117d20c4a"
+      },
+      "modes": {
+        "on": {
+          "set": {"ZUICITY_ENABLE_GSO": "1"},
+          "unset": ["ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present"
+        },
+        "off": {
+          "set": {"ZUICITY_DISABLE_GSO": "1"},
+          "unset": ["ZUICITY_ENABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "absent"
+        }
+      }
+    },
+    {
+      "id": "go-repaired",
+      "label": "Juicity Go v0.5.0 (repaired GSO)",
+      "version": "v0.5.0 with full GSO repair",
+      "source": "pinned repaired interoperability package",
+      "family": "go",
+      "client": {
+        "path": "${GO_REPAIRED_BIN_DIR}/juicity-client",
+        "sha256": "995c20ddc6a10e9bf6e589bb09538c5692029ac4748cd4bcf684e4732091fafb"
+      },
+      "server": {
+        "path": "${GO_REPAIRED_BIN_DIR}/juicity-server",
+        "sha256": "f5af206e9f49c00ec7399da39da49a861c0b4081716604b7fd8c379304780198"
+      },
+      "modes": {
+        "on": {
+          "set": {"QUIC_GO_DISABLE_GSO": ""},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO"],
+          "gso_trace": "present"
+        },
+        "off": {
+          "set": {"QUIC_GO_DISABLE_GSO": "true"},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO"],
+          "gso_trace": "absent"
+        }
+      }
+    }
+  ]
+}

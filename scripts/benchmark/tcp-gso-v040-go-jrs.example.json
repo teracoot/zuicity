@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "suite": "zuicity-v0.4.0-stock-repaired-go-latest-juicity-rs",
+  "reference": "candidate",
+  "implementations": [
+    {
+      "id": "candidate",
+      "label": "Zuicity v0.4.0 (benchmark-winning build)",
+      "version": "0.4.0 at 2d1fc10454f30e89d72b85348114e5a019b13b2e",
+      "source": "qualified release-proof artifact",
+      "family": "zuicity-rust",
+      "client": {
+        "path": "${CANDIDATE_BIN_DIR}/zuicity-client",
+        "sha256": "079c7716959a2d05a02de74af4dddbb7df44fa18e5a9e04edff8ddc7ed75e3e7"
+      },
+      "server": {
+        "path": "${CANDIDATE_BIN_DIR}/zuicity-server",
+        "sha256": "cec42e54cd06e6861894352b635e22d04f08f2693cdb395f9649be426658b5a1"
+      },
+      "modes": {
+        "on": {
+          "set": {"ZUICITY_ENABLE_GSO": "1"},
+          "unset": ["ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present",
+          "effective_gso": "client_on_server_on"
+        },
+        "off": {
+          "set": {"ZUICITY_DISABLE_GSO": "1"},
+          "unset": ["ZUICITY_ENABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "absent",
+          "effective_gso": "client_off_server_off"
+        }
+      }
+    },
+    {
+      "id": "go-stock",
+      "label": "Juicity Go v0.5.0 (stock upstream build)",
+      "version": "v0.5.0; go1.24.4 linux/amd64; CGO_ENABLED=0",
+      "source": "pinned historical benchmark-kit comparator",
+      "family": "go",
+      "client": {
+        "path": "${GO_STOCK_BIN_DIR}/juicity-client",
+        "sha256": "a98d80d659cf4c7cbd1b8cca0c977f84d0ab1251194421714a6877cd5744abbf"
+      },
+      "server": {
+        "path": "${GO_STOCK_BIN_DIR}/juicity-server",
+        "sha256": "f5af206e9f49c00ec7399da39da49a861c0b4081716604b7fd8c379304780198"
+      },
+      "modes": {
+        "on": {
+          "set": {},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present",
+          "effective_gso": "shipping_client_off_server_on"
+        },
+        "off": {
+          "set": {"QUIC_GO_DISABLE_GSO": "true"},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO"],
+          "gso_trace": "absent",
+          "effective_gso": "client_off_server_off"
+        }
+      }
+    },
+    {
+      "id": "go-repaired",
+      "label": "Juicity Go v0.5.0 (repaired full-GSO client)",
+      "version": "v0.5.0 with connected-UDP OOB-preservation repair",
+      "source": "pinned repaired interoperability package",
+      "family": "go",
+      "client": {
+        "path": "${GO_REPAIRED_BIN_DIR}/juicity-client",
+        "sha256": "995c20ddc6a10e9bf6e589bb09538c5692029ac4748cd4bcf684e4732091fafb"
+      },
+      "server": {
+        "path": "${GO_REPAIRED_BIN_DIR}/juicity-server",
+        "sha256": "f5af206e9f49c00ec7399da39da49a861c0b4081716604b7fd8c379304780198"
+      },
+      "modes": {
+        "on": {
+          "set": {"QUIC_GO_DISABLE_GSO": ""},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO"],
+          "gso_trace": "present",
+          "effective_gso": "client_on_server_on"
+        },
+        "off": {
+          "set": {"QUIC_GO_DISABLE_GSO": "true"},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO"],
+          "gso_trace": "absent",
+          "effective_gso": "client_off_server_off"
+        }
+      }
+    },
+    {
+      "id": "juicity-rs",
+      "label": "juicity-rs v0.1.0.beta.8 (latest official x86-64-v3 build)",
+      "version": "v0.1.0.beta.8 at 33caa0f012a7414753870c05bd2987467113e809",
+      "source": "official juicity-x86_64-unknown-linux-gnu-v3.zip release asset; archive sha256 4843d8e4f06a32c4f6794d72fc1ef7f8cc8dfd1ee8d0a25f700d0e42906edcf4",
+      "family": "juicity-rs",
+      "client": {
+        "path": "${JUICITY_RS_BIN_DIR}/juicity-client",
+        "sha256": "a59f3c699100511a009a2d8fb7d5aa094ce90de60d73f34306685a23a0c71ecb"
+      },
+      "server": {
+        "path": "${JUICITY_RS_BIN_DIR}/juicity-server",
+        "sha256": "27f65fcbd822c7105b69b847547a8d802cd6eee2194f31696d4ddc0708d870b8"
+      },
+      "modes": {
+        "on": {
+          "set": {},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "present",
+          "effective_gso": "client_on_server_on_unmodified_quinn_default",
+          "probe_accept_trace_with_driver_error": true
+        },
+        "off": {
+          "set": {},
+          "unset": ["ZUICITY_ENABLE_GSO", "ZUICITY_DISABLE_GSO", "QUIC_GO_DISABLE_GSO"],
+          "gso_trace": "absent",
+          "effective_gso": "client_off_server_off_external_capability_control",
+          "preload": {
+            "client": {
+              "path": "${JUICITY_RS_GSO_SHIM}",
+              "sha256": "5f92763ee927d66da53847a2aaf04bb8a39c7784e3423f11eb084fd43aaaf4d5"
+            },
+            "server": {
+              "path": "${JUICITY_RS_GSO_SHIM}",
+              "sha256": "5f92763ee927d66da53847a2aaf04bb8a39c7784e3423f11eb084fd43aaaf4d5"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

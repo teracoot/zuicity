@@ -1,160 +1,184 @@
 # Zuicity Benchmark Guidelines
 
-This document defines the benchmark protocol for comparing three Juicity runtime
-entries across local veth and WAN Oracle paths. It exists because earlier ad hoc
-runs mixed sample counts, host labels, and memory collection methods, which made
-the resulting spreadsheets hard to compare.
+This document defines the evidence contract for Zuicity release comparisons.
+The canonical local runner is the manifest-driven TCP GSO suite documented in
+`scripts/benchmark/README.md`. Older three-way scripts, charts, spreadsheets,
+and ad hoc campaign labels remain historical evidence only.
 
-## Privacy Rules
+## Privacy rules
 
-- Reports, filenames, charts, and spreadsheets must use anonymized host labels
-  only: `oracle-a`, `oracle-b`, and `oracle-target`.
-- Do not write personal host nicknames, public IP addresses, SSH usernames,
-  private key paths, tokens, UUIDs, passwords, SNI names, or certificate paths
+- Reports and public artifacts must use anonymized host labels such as
+  `oracle-a`, `oracle-b`, and `oracle-target`.
+- Do not store public IP addresses, SSH usernames, private key paths, tokens,
+  UUIDs, passwords, private SNI names, or certificate paths in repository
+  artifacts.
+- Private connection profiles may be supplied at runtime but must not be copied
   into benchmark output.
-- Raw connection profiles may be used locally to run a benchmark, but their
-  contents must never be copied into this repository or benchmark artifacts.
-- If an old raw artifact contains personal labels, rewrite the public report with
-  anonymized labels before publishing or sharing.
+- Rewrite personal labels before publishing an old raw artifact.
 
-## Required Entries
+## Artifact identity
 
-Every benchmark round must include exactly these three entries unless the report
-explicitly marks an entry as blocked:
+- Pin every client and server with a full SHA256 in a versioned manifest.
+- Record the source commit/release and an unambiguous human label.
+- Verify all hashes before probes or timed work starts.
+- Treat a client/server pair as one implementation artifact. Sharing only one
+  binary hash with another campaign does not establish equivalent provenance.
+- Never infer release identity from a directory, campaign nickname, branch, or
+  remembered result.
+- Do not compare debug binaries with release binaries. Disclose differing target
+  features, libc, or build systems when they cannot be held constant.
 
-| Public label | Meaning | Binary/config rule |
-| --- | --- | --- |
-| `go-dae` | Go/dae baseline for Juicity traffic | Use the Go baseline client/server or dae route that owns the comparison target. Record the exact commit or release. |
-| `zuicity-prev` | Previous accepted Zuicity build | Use the last accepted release artifact, not a rebuild from current sources. |
-| `zuicity-current` | Current Zuicity build under review | Use the binary built from the exact worktree/commit being evaluated. |
+The historical `h156` no-GSO win was not a released-v0.3.0 result. Its exact
+hashes and the repeated same-hash v0.3.0 losses are recorded in
+`scripts/benchmark/README.md`.
 
-Do not compare a debug build against release binaries. Do not mix zigbuild and
-native cargo artifacts unless the report says so and gives hashes for both.
+## Required local treatments
 
-## Required Topologies
+The v0.4.0 candidate manifest contains four implementations:
 
-### Local veth
+| ID | Meaning |
+| --- | --- |
+| `candidate` | Exact candidate under review and summary reference |
+| `v030` | Exact released v0.3.0 package |
+| `v040-prior` | Previous accepted v0.4.0 package |
+| `go-repaired` | Pinned repaired Juicity Go comparator |
 
-Run each entry in two Linux network namespaces connected by a veth pair. Traffic
-must cross the kernel IP stack and QUIC stack; localhost-only proxy smoke tests
-do not count as a benchmark.
+Each implementation must run in both GSO-on and GSO-off mode. The resulting
+eight treatments must remain distinct in raw rows and summaries. Adding or
+removing an implementation requires a new manifest and a newly validated
+complete schedule.
 
-Required metrics per entry:
+## Local topology and workload
 
-- TCP fresh connect + 64-byte RTT: `n`, mean, median, p95, min, max in ms.
-- TCP persistent 64-byte RTT on one kept-open connection: same fields.
-- TCP throughput: 4 MiB echo transfer, mean/median/min/max in Mbps.
-- UDP 64-byte RTT: same latency fields.
-- Client and server RSS: baseline, peak, and post-run idle KiB or MiB.
-- Driver errors and timeout counts.
+- Run each row in two fresh Linux network namespaces connected by a `veth` pair.
+- Place the echo target and server in one namespace and the client/driver in the
+  other so traffic traverses real IP and QUIC stacks.
+- Use equivalent UUID/password class, TLS policy, congestion control, target,
+  payload sizes, and forwarding config for all artifacts.
+- Set `TCP_NODELAY` for latency and throughput sockets.
+- Warm up each treatment before recording samples.
+- Measure fresh TCP connect plus full 64-byte echo RTT.
+- Measure repeated 64-byte echoes over one persistent TCP connection.
+- Measure a fixed payload send plus full echo receive; the canonical payload is
+  4 MiB.
+- Capture driver errors, timeouts, process CPU, and client/server RSS/HWM.
 
-Default local settings:
+This suite is a single-host relative comparison. Absolute throughput does not
+represent a physical NIC, Internet path, or isolated QUIC primitive.
 
-- `reps=5` rotated across entries to reduce ordering bias.
-- `iters=60` for RTT metrics.
-- At least 5 throughput transfers per implementation run.
-- One clean output directory per benchmark run.
+## Schedule and inference
 
-### WAN Oracle Paths
+- Use the even-treatment Williams square generated by `tcp_gso_suite.py`.
+- `standard` is one complete eight-rotation block.
+- `release` is two complete blocks; the second reverses rotation order.
+- Rotate all eight treatments rather than grouping by implementation or mode.
+- Use one accepted rotation-level row median as the statistical replicate.
+- Never pool transfer samples across rows as if they were independent runs.
+- Pair reference and comparator rows from the same rotation and mode.
+- Report paired median percent change, wins/losses/ties, and the exact one-sided
+  sign-test p-value.
+- Mark an incomplete schedule as noncanonical. A `smoke` result is execution
+  validation, never release-ranking evidence.
 
-Run the same three entries over both real Internet client paths:
+Canonical sample counts are 60 fresh RTT samples, 60 persistent RTT samples, 100
+throughput samples, a 4 MiB payload, and 5 warmup transfers per row. Overrides
+must be reported and must not be described as the unchanged canonical profile.
 
-- `oracle-a -> oracle-target`
-- `oracle-b -> oracle-target`
+## GSO proof
 
-The WAN harness should start temporary benchmark clients, servers, and echo
-targets on non-production ports. It must not replace release assets, restart
-unrelated services, alter firewall defaults, or disturb live UDP ports. If an
-existing service must be stopped, the report must treat that as a separate
-operator-approved maintenance action and record the restore command and final
-health check.
+Run separate traced probes before any untraced measured row:
 
-Required WAN metrics per path and entry:
+- GSO-on passes only after a successful `UDP_SEGMENT` send.
+- GSO-off passes only when no `UDP_SEGMENT` send is attempted.
+- Accept symbolic `UDP_SEGMENT` or Linux cmsg type `0x67`/`103` only at
+  `SOL_UDP`/`IPPROTO_UDP` level.
+- Preserve raw trace shards for audit, but do not time measured rows under
+  `strace`.
+- Fail the campaign on a probe mismatch; do not downgrade it to a warning.
 
-- TCP fresh connect RTT, TCP persistent RTT, TCP throughput, and UDP RTT.
-- Server RSS on `oracle-target`; client RSS on `oracle-a`/`oracle-b` when
-  available.
-- Packet loss/timeouts/errors.
-- Base network RTT sample between client host and target host before each run.
+Record the exact environment set/unset operations. For the pinned suite, Rust
+uses `ZUICITY_ENABLE_GSO=1` for on and `ZUICITY_DISABLE_GSO=1` for off. Repaired
+Go uses an empty `QUIC_GO_DISABLE_GSO` for on and `true` for off.
 
-## Consistency Rules
+## Host controls and quality gates
 
-- Build or fetch all entries before timing starts. Record SHA256 for every
-  client and server binary.
-- Run entries in rotated order, not grouped by implementation.
-- Keep server configs equivalent: same UUID/password class, same congestion
-  control, same TLS/SNI policy, same target echo service, same payload sizes.
-- Warm up every entry before recording metrics.
-- Record kernel, distro, CPU model, CPU governor, NIC/offload state when
-  available, and whether `ZUICITY_ENABLE_GSO` or `ZUICITY_WORKER_THREADS` is set.
-- Store raw JSONL. Spreadsheets and charts are derived artifacts, not evidence.
-- Publish medians for local veth and averages only when the harness explicitly
-  defines averages. Do not mix medians and means in one table without labels.
-- A run with any driver error is not a clean win, even if some metrics look good.
+- Build or fetch every artifact before timing begins.
+- Pin measured processes to an explicitly reviewed CPU set for standard/release
+  runs.
+- Record kernel, distro, CPU model, affinity, frequency/governor information,
+  and thermal sensors when available.
+- Wait for the pre-row CPU gate instead of benchmarking through known host load.
+- Monitor non-affinity CPU activity, frequency ratio, and temperature during
+  each row.
+- Retain rejected attempts with reasons and retry only up to the configured
+  maximum.
+- Report monitor availability. Missing sensors are an evidence limitation, not
+  a zero value.
+- Stop on driver errors, malformed sample counts, stale suite namespaces, or an
+  existing output directory.
+- Do not stop unrelated workloads or delete unexplained namespaces to make a run
+  pass.
 
-## Output Layout
+## Evidence layout
 
-Use this structure for each benchmark session:
+Keep raw evidence and derived reports together:
 
 ```text
-benchmark-results/<timestamp>/
-  veth/
-    results.jsonl
-    memory.jsonl
-    benchmark-chart.md
-    benchmark-chart.svg
-    summary.md
-    binaries.sha256
-  wan/
-    oracle-a/results.jsonl
-    oracle-a/memory.jsonl
-    oracle-b/results.jsonl
-    oracle-b/memory.jsonl
-    summary.md
-  SHA256SUMS
+benchmark-results/<campaign>/
+  captures/<row-tag>/
+  meta/binaries.sha256
+  meta/harness.sha256
+  meta/host.json
+  meta/method.json
+  meta/resolved-manifest.json
+  meta/schedule.json
+  meta/versions/
+  probes.jsonl
+  rejected.jsonl
+  results.jsonl
+  summary.json
+  summary.md
 ```
 
-The public summary must include the exact command lines, sample counts, all
-warnings/blockers, and a clear go/no-go conclusion.
+- `results.jsonl` contains only accepted measured rows.
+- `rejected.jsonl` preserves attempts rejected by host quality gates.
+- `probes.jsonl` records the GSO contract independently of timed rows.
+- `summary.json` and `summary.md` are derived; raw JSONL and captures remain the
+  evidence.
+- `meta/harness.sha256` pins the exact scripts that produced the campaign.
+- Never overwrite or merge campaign directories after execution.
+- Inspect capture sizes before opening raw traces; probe summaries are the first
+  audit surface.
 
-## Local Command Pattern
+The public conclusion must include the manifest identity, profile, CPU set,
+accepted/rejected row counts, monitor limitations, probe status, all errors, and
+whether the schedule was canonical.
 
-Prepare directories with the expected binary names:
+## WAN evidence
 
-```bash
-mkdir -p /tmp/jbench/go-dae /tmp/jbench/zuicity-prev /tmp/jbench/zuicity-current
-# go-dae:        juicity-client, juicity-server
-# zuicity-prev:  zuicity-client, zuicity-server from the previous accepted release
-# zuicity-current: zuicity-client, zuicity-server from the current build
-```
+WAN testing is supplemental and is not implemented by the local GSO suite. Run
+temporary clients, servers, and echo targets on non-production ports using
+private runtime profiles and anonymized public labels.
 
-Run each entry through `scripts/benchmark/bench-one.sh` in rotated order, capture
-all JSON lines, and append RSS samples to `memory.jsonl` when RSS sampling is
-enabled. `scripts/benchmark/run-comparison.sh` is suitable for the historical
-`rust/go/juicityrs` naming scheme; for the labels in this guideline, use a
-wrapper that preserves `go-dae`, `zuicity-prev`, and `zuicity-current` in raw
-JSONL.
+- Cover both `oracle-a -> oracle-target` and `oracle-b -> oracle-target` when the
+  release protocol requires those paths.
+- Record base network RTT, forwarding metrics, RSS where available, loss,
+  timeouts, and errors.
+- Do not replace release assets, restart unrelated services, alter firewall
+  defaults, or disturb live UDP ports.
+- Treat stopping an existing service as a separate operator-approved maintenance
+  action with a restore command and final health check.
+- Do not combine WAN and local-veth samples in one statistical population.
 
-## WAN Command Pattern
+## Release decision rules
 
-Use a SOCKS5 benchmark client equivalent to the historical WAN harness:
-
-```bash
-python3 bench_client.py \
-  --label oracle-a \
-  --implementation zuicity-current \
-  --proxy-host 127.0.0.1 \
-  --proxy-port 21080 \
-  --target-host 127.0.0.1 \
-  --tcp-port 28080 \
-  --udp-port 28081 \
-  --runs 5 \
-  --connect-samples 20 \
-  --persistent-samples 100 \
-  --udp-samples 50 \
-  --throughput-bytes 33554432
-```
-
-The command above is a shape, not a license to expose host details. Substitute
-hosts and ports from private connection profiles at runtime only, and save output
-under anonymized `oracle-a`/`oracle-b` paths.
+- A hash mismatch, failed GSO probe, driver error, or incomplete treatment row is
+  a failed campaign.
+- A campaign with exhausted quality-gate retries is incomplete, not a loss for
+  that treatment.
+- A performance claim applies only to the exact artifact hashes, mode controls,
+  workload, host, and schedule in its evidence directory.
+- Historical results may explain an investigation but cannot substitute for a
+  complete current release campaign.
+- Commit, tag, publish, or replace release artifacts only after the evidence is
+  reviewed independently of the source change under test.

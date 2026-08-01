@@ -258,6 +258,10 @@ hashes.
   primitives.
 - The official `juicity/juicity-rs` release timed out during the benchmark, so
   its numbers are not a stable ranking.
+- The historical no-GSO result of 731.27 Mbps versus Go at 660.86 Mbps belongs
+  to the `h156` development artifact, not released v0.3.0, and used a different
+  Go client from the repaired comparator. Exact hashes and repeated
+  released-v0.3.0 results are recorded in `scripts/benchmark/README.md`.
 - GSO throughput depends on kernel/NIC support; on GSO-hostile paths the port
   falls back to the plain path and tracks closer to the pre-GSO throughput while
   remaining correct.
