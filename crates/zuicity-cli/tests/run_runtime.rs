@@ -41,6 +41,53 @@ fn write_config(path: &str, contents: &str) {
     std::fs::write(path, contents).expect("write config fixture");
 }
 
+fn outbound_socks5_server_config(
+    server_addr: std::net::SocketAddr,
+    uuid: uuid::Uuid,
+    password: &str,
+    cert: &zuicity_testkit::CertFixture,
+    proxy_addr: std::net::SocketAddr,
+) -> String {
+    let users = std::collections::BTreeMap::from([(uuid.to_string(), password)]);
+    serde_json::to_string(&serde_json::json!({
+        "listen": server_addr.to_string(),
+        "users": users,
+        "certificate": cert.cert_path,
+        "private_key": cert.key_path,
+        "log_level": "debug",
+        "outbound": {
+            "type": "socks5",
+            "server": proxy_addr.ip().to_string(),
+            "server_port": proxy_addr.port()
+        }
+    }))
+    .expect("serialize outbound SOCKS5 server config")
+}
+
+fn assert_managed_server_terminated(
+    exit: &zuicity_testkit::ManagedProcessExit,
+    log_path: &std::path::Path,
+) {
+    #[cfg(unix)]
+    {
+        assert!(
+            !exit.forced,
+            "zuicity-server should handle SIGTERM without SIGKILL"
+        );
+        assert!(
+            exit.status.success(),
+            "exit={exit:?}; log={}",
+            log_path.display()
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        exit.forced,
+        "Windows test termination should use the direct child-process path; log={}",
+        log_path.display()
+    );
+}
+
 fn spawn_bin(bin: &str, args: &[&str]) -> Child {
     let path = match bin {
         "zuicity-client" => env!("CARGO_BIN_EXE_zuicity-client"),
@@ -2054,6 +2101,516 @@ fn server_run_relay_tcp_proxy_from_rust_client() {
                 "exit={exit:?}; log={log:?}"
             );
         });
+}
+
+#[test]
+fn server_run_routes_tcp_through_outbound_socks5_block() {
+    let _port_bound_runtime_test = port_bound_runtime_test_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async {
+            let artifact = zuicity_testkit::artifact_dir("cli server outbound socks5 tcp")
+                .create()
+                .expect("create artifact dir");
+            let cert =
+                zuicity_testkit::write_self_signed_cert_fixture(artifact.path(), "localhost")
+                    .expect("write cert fixture");
+            let reserved = zuicity_testkit::reserve_udp_socket().expect("reserve server UDP port");
+            let server_addr = reserved.local_addr().expect("server local addr");
+            drop(reserved);
+            let (proxy_addr, mut proxy_requests, proxy_task) =
+                zuicity_testkit::start_socks5_tcp_connect_proxy()
+                    .await
+                    .expect("start SOCKS5 TCP connect proxy");
+
+            let uuid =
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("parse uuid");
+            let password = "password";
+            let config_path = artifact.path().join("server.json");
+            write_config(
+                config_path.to_str().expect("utf8 config path"),
+                &outbound_socks5_server_config(server_addr, uuid, password, &cert, proxy_addr),
+            );
+
+            let echo = zuicity_testkit::TcpEchoServer::start()
+                .await
+                .expect("start TCP echo fixture");
+            let bin = env!("CARGO_BIN_EXE_zuicity-server");
+            let log_path = artifact.path().join("zuicity-server.log");
+            let mut process = zuicity_testkit::ManagedProcessBuilder::new(bin)
+                .arg("run")
+                .arg("-c")
+                .arg(config_path.to_str().expect("utf8 config path"))
+                .log_path(&log_path)
+                .start()
+                .expect("spawn zuicity-server run");
+
+            let roots_pem = std::fs::read(&cert.cert_path).expect("read cert roots");
+            let connection = connect_managed_with_retry(
+                server_addr,
+                &roots_pem,
+                uuid,
+                password.as_bytes(),
+                &process,
+            )
+            .await;
+
+            let payload = b"cli server outbound socks5 tcp";
+            let echo_addr = echo.local_addr();
+            let mut stream = connection
+                .open_tcp_proxy_stream(echo_addr.ip(), echo_addr.port())
+                .await
+                .expect("open TCP proxy stream");
+            stream.write_all(payload).await.expect("write TCP payload");
+            stream.finish().expect("finish TCP proxy stream");
+            let echoed = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(1024))
+                .await
+                .expect("TCP proxy echo timeout")
+                .expect("read echoed TCP payload");
+            assert_eq!(echoed, payload);
+
+            let request = tokio::time::timeout(Duration::from_secs(3), proxy_requests.recv())
+                .await
+                .expect("SOCKS5 proxy did not receive CONNECT")
+                .expect("SOCKS5 proxy request channel closed");
+            assert_eq!(request.target, echo_addr);
+
+            echo.shutdown().await.expect("shutdown TCP echo fixture");
+            let exit = process
+                .terminate(Duration::from_secs(2))
+                .expect("terminate zuicity-server run");
+            assert_managed_server_terminated(&exit, &log_path);
+            proxy_task
+                .await
+                .expect("join proxy task")
+                .expect("proxy ok");
+        });
+}
+
+#[test]
+fn server_run_routes_concurrent_tcp_through_outbound_socks5_block() {
+    let _port_bound_runtime_test = port_bound_runtime_test_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async {
+            let artifact =
+                zuicity_testkit::artifact_dir("cli server outbound socks5 concurrent tcp")
+                    .create()
+                    .expect("create artifact dir");
+            let cert =
+                zuicity_testkit::write_self_signed_cert_fixture(artifact.path(), "localhost")
+                    .expect("write cert fixture");
+            let reserved = zuicity_testkit::reserve_udp_socket().expect("reserve server UDP port");
+            let server_addr = reserved.local_addr().expect("server local addr");
+            drop(reserved);
+            let (proxy_addr, mut proxy_requests, proxy_task) =
+                zuicity_testkit::start_socks5_tcp_connect_proxy_multi(16)
+                    .await
+                    .expect("start multi SOCKS5 TCP connect proxy");
+
+            let uuid =
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("parse uuid");
+            let password = "password";
+            let config_path = artifact.path().join("server.json");
+            write_config(
+                config_path.to_str().expect("utf8 config path"),
+                &outbound_socks5_server_config(server_addr, uuid, password, &cert, proxy_addr),
+            );
+
+            let echo = zuicity_testkit::TcpEchoServer::start()
+                .await
+                .expect("start TCP echo fixture");
+            let bin = env!("CARGO_BIN_EXE_zuicity-server");
+            let log_path = artifact.path().join("zuicity-server.log");
+            let mut process = zuicity_testkit::ManagedProcessBuilder::new(bin)
+                .arg("run")
+                .arg("-c")
+                .arg(config_path.to_str().expect("utf8 config path"))
+                .log_path(&log_path)
+                .start()
+                .expect("spawn zuicity-server run");
+
+            let roots_pem = std::fs::read(&cert.cert_path).expect("read cert roots");
+            let connection = connect_managed_with_retry(
+                server_addr,
+                &roots_pem,
+                uuid,
+                password.as_bytes(),
+                &process,
+            )
+            .await;
+
+            let echo_addr = echo.local_addr();
+            let mut handles = Vec::new();
+            for index in 0..8 {
+                let connection = connection.clone();
+                handles.push(tokio::spawn(async move {
+                    let payload = format!("cli concurrent outbound socks5 {index}");
+                    let mut stream = connection
+                        .open_tcp_proxy_stream(echo_addr.ip(), echo_addr.port())
+                        .await
+                        .expect("open TCP proxy stream");
+                    stream
+                        .write_all(payload.as_bytes())
+                        .await
+                        .expect("write TCP payload");
+                    stream.finish().expect("finish TCP proxy stream");
+                    let echoed =
+                        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(1024))
+                            .await
+                            .expect("TCP proxy echo timeout")
+                            .expect("read echoed TCP payload");
+                    assert_eq!(echoed, payload.as_bytes());
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("join concurrent stream task");
+            }
+
+            let mut seen = 0;
+            while seen < 8 {
+                let request = tokio::time::timeout(Duration::from_secs(3), proxy_requests.recv())
+                    .await
+                    .expect("SOCKS5 proxy did not receive enough CONNECT requests")
+                    .expect("SOCKS5 proxy request channel closed");
+                assert_eq!(request.target, echo_addr);
+                seen += 1;
+            }
+
+            echo.shutdown().await.expect("shutdown TCP echo fixture");
+            let exit = process
+                .terminate(Duration::from_secs(2))
+                .expect("terminate zuicity-server run");
+            assert_managed_server_terminated(&exit, &log_path);
+            proxy_task.abort();
+        });
+}
+
+#[test]
+fn server_run_routes_udp_through_outbound_socks5_block() {
+    let _port_bound_runtime_test = port_bound_runtime_test_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async {
+            let artifact = zuicity_testkit::artifact_dir("cli server outbound socks5 udp")
+                .create()
+                .expect("create artifact dir");
+            let cert =
+                zuicity_testkit::write_self_signed_cert_fixture(artifact.path(), "localhost")
+                    .expect("write cert fixture");
+            let reserved = zuicity_testkit::reserve_udp_socket().expect("reserve server UDP port");
+            let server_addr = reserved.local_addr().expect("server local addr");
+            drop(reserved);
+            let (proxy_addr, mut proxy_requests, proxy_task) =
+                zuicity_testkit::start_socks5_udp_associate_proxy()
+                    .await
+                    .expect("start SOCKS5 UDP associate proxy");
+
+            let uuid =
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("parse uuid");
+            let password = "password";
+            let config_path = artifact.path().join("server.json");
+            write_config(
+                config_path.to_str().expect("utf8 config path"),
+                &outbound_socks5_server_config(server_addr, uuid, password, &cert, proxy_addr),
+            );
+
+            let echo = zuicity_testkit::UdpEchoServer::start()
+                .await
+                .expect("start UDP echo fixture");
+            let bin = env!("CARGO_BIN_EXE_zuicity-server");
+            let log_path = artifact.path().join("zuicity-server.log");
+            let mut process = zuicity_testkit::ManagedProcessBuilder::new(bin)
+                .arg("run")
+                .arg("-c")
+                .arg(config_path.to_str().expect("utf8 config path"))
+                .log_path(&log_path)
+                .start()
+                .expect("spawn zuicity-server run");
+
+            let roots_pem = std::fs::read(&cert.cert_path).expect("read cert roots");
+            let connection = connect_managed_with_retry(
+                server_addr,
+                &roots_pem,
+                uuid,
+                password.as_bytes(),
+                &process,
+            )
+            .await;
+
+            let payload = b"cli server outbound socks5 udp";
+            let echo_addr = echo.local_addr();
+            let mut stream = connection
+                .open_udp_over_stream(echo_addr.ip(), echo_addr.port())
+                .await
+                .expect("open UDP-over-stream");
+            stream.send_datagram(payload).await.expect("send datagram");
+            let echoed = tokio::time::timeout(Duration::from_secs(5), stream.recv_datagram(1024))
+                .await
+                .expect("UDP relay response timeout")
+                .expect("receive datagram");
+            assert_eq!(echoed.target, echo_addr);
+            assert_eq!(echoed.payload, payload);
+            stream.finish().expect("finish UDP stream");
+
+            let request = tokio::time::timeout(Duration::from_secs(3), proxy_requests.recv())
+                .await
+                .expect("SOCKS5 proxy did not receive UDP ASSOCIATE payload")
+                .expect("SOCKS5 proxy request channel closed");
+            assert_eq!(request.target, echo_addr);
+
+            echo.shutdown().await.expect("shutdown UDP echo fixture");
+            let exit = process
+                .terminate(Duration::from_secs(2))
+                .expect("terminate zuicity-server run");
+            assert_managed_server_terminated(&exit, &log_path);
+            proxy_task
+                .await
+                .expect("join proxy task")
+                .expect("proxy ok");
+        });
+}
+
+#[test]
+fn server_run_outbound_socks5_unreachable_keeps_process_alive() {
+    let _port_bound_runtime_test = port_bound_runtime_test_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async {
+            let artifact =
+                zuicity_testkit::artifact_dir("cli server outbound socks5 unreachable")
+                    .create()
+                    .expect("create artifact dir");
+            let cert = zuicity_testkit::write_self_signed_cert_fixture(artifact.path(), "localhost")
+                .expect("write cert fixture");
+            let reserved = zuicity_testkit::reserve_udp_socket().expect("reserve server UDP port");
+            let server_addr = reserved.local_addr().expect("server local addr");
+            drop(reserved);
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed proxy");
+            let closed_addr = closed.local_addr().expect("closed proxy addr");
+            drop(closed);
+
+            let uuid = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                .expect("parse uuid");
+            let password = "password";
+            let config_path = artifact.path().join("server.json");
+            write_config(
+                config_path.to_str().expect("utf8 config path"),
+                &outbound_socks5_server_config(server_addr, uuid, password, &cert, closed_addr),
+            );
+
+            let bin = env!("CARGO_BIN_EXE_zuicity-server");
+            let log_path = artifact.path().join("zuicity-server.log");
+            let mut process = zuicity_testkit::ManagedProcessBuilder::new(bin)
+                .arg("run")
+                .arg("-c")
+                .arg(config_path.to_str().expect("utf8 config path"))
+                .log_path(&log_path)
+                .start()
+                .expect("spawn zuicity-server run");
+
+            let roots_pem = std::fs::read(&cert.cert_path).expect("read cert roots");
+            let connection = connect_managed_with_retry(
+                server_addr,
+                &roots_pem,
+                uuid,
+                password.as_bytes(),
+                &process,
+            )
+            .await;
+            let mut stream = connection
+                .open_tcp_proxy_stream(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9)
+                .await
+                .expect("open TCP proxy stream");
+            let write_result = stream.write_all(b"should-fail").await;
+            let read_result =
+                tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(64)).await;
+            let session_failed = write_result.is_err()
+                || match &read_result {
+                    Err(_) => true,
+                    Ok(Err(_)) => true,
+                    Ok(Ok(bytes)) => bytes.is_empty(),
+                };
+            assert!(
+                session_failed,
+                "unreachable SOCKS5 should fail the session, write={write_result:?} read={read_result:?}"
+            );
+            assert!(
+                process.is_running().expect("poll server process"),
+                "server must stay alive after outbound SOCKS5 failure; log={}",
+                log_path.display()
+            );
+
+            let exit = process
+                .terminate(Duration::from_secs(2))
+                .expect("terminate zuicity-server run");
+            assert_managed_server_terminated(&exit, &log_path);
+        });
+}
+
+#[test]
+fn server_run_outbound_socks5_silent_proxy_times_out_and_recovers() {
+    let _port_bound_runtime_test = port_bound_runtime_test_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime")
+        .block_on(async {
+            let artifact =
+                zuicity_testkit::artifact_dir("cli server outbound socks5 silent recovery")
+                    .create()
+                    .expect("create artifact dir");
+            let cert =
+                zuicity_testkit::write_self_signed_cert_fixture(artifact.path(), "localhost")
+                    .expect("write cert fixture");
+            let reserved = zuicity_testkit::reserve_udp_socket().expect("reserve server UDP port");
+            let server_addr = reserved.local_addr().expect("server local addr");
+            drop(reserved);
+            let echo = zuicity_testkit::TcpEchoServer::start()
+                .await
+                .expect("start TCP echo fixture");
+            let echo_addr = echo.local_addr();
+            let (proxy_addr, mut proxy_requests, proxy_task) =
+                zuicity_testkit::start_socks5_tcp_connect_proxy_after_silent_connection()
+                    .await
+                    .expect("start silent-then-ready SOCKS5 proxy");
+
+            let uuid =
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("parse uuid");
+            let password = "password";
+            let config_path = artifact.path().join("server.json");
+            write_config(
+                config_path.to_str().expect("utf8 config path"),
+                &outbound_socks5_server_config(server_addr, uuid, password, &cert, proxy_addr),
+            );
+
+            let log_path = artifact.path().join("zuicity-server.log");
+            let mut process =
+                zuicity_testkit::ManagedProcessBuilder::new(env!("CARGO_BIN_EXE_zuicity-server"))
+                    .arg("run")
+                    .arg("-c")
+                    .arg(config_path.to_str().expect("utf8 config path"))
+                    .log_path(&log_path)
+                    .start()
+                    .expect("spawn zuicity-server run");
+            let roots_pem = std::fs::read(&cert.cert_path).expect("read cert roots");
+            let connection = connect_managed_with_retry(
+                server_addr,
+                &roots_pem,
+                uuid,
+                password.as_bytes(),
+                &process,
+            )
+            .await;
+
+            let started = tokio::time::Instant::now();
+            let mut stalled = connection
+                .open_tcp_proxy_stream(echo_addr.ip(), echo_addr.port())
+                .await
+                .expect("open stalled TCP proxy stream");
+            stalled
+                .write_all(b"must time out")
+                .await
+                .expect("write stalled payload");
+            stalled.finish().expect("finish stalled proxy stream");
+            let stalled_result = tokio::time::timeout(
+                zuicity_transport::SOCKS5_SETUP_TIMEOUT + Duration::from_secs(3),
+                stalled.read_to_end(64),
+            )
+            .await
+            .expect("server did not enforce SOCKS5 setup deadline");
+            assert!(
+                stalled_result.is_err() || stalled_result.is_ok_and(|bytes| bytes.is_empty()),
+                "silent SOCKS5 session must fail closed"
+            );
+            assert!(started.elapsed() >= zuicity_transport::SOCKS5_SETUP_TIMEOUT);
+            assert!(
+                started.elapsed()
+                    < zuicity_transport::SOCKS5_SETUP_TIMEOUT + Duration::from_secs(3)
+            );
+            process
+                .wait_for_log_contains("SOCKS5 proxy setup timed out", Duration::from_secs(2))
+                .expect("server must log the bounded SOCKS5 setup timeout");
+            assert!(
+                process.is_running().expect("poll server process"),
+                "server must stay alive after silent SOCKS5 timeout; log={}",
+                log_path.display()
+            );
+
+            let payload = b"silent SOCKS5 recovery";
+            let mut recovered = connection
+                .open_tcp_proxy_stream(echo_addr.ip(), echo_addr.port())
+                .await
+                .expect("open recovery TCP proxy stream");
+            recovered
+                .write_all(payload)
+                .await
+                .expect("write recovery payload");
+            recovered.finish().expect("finish recovery proxy stream");
+            let echoed = tokio::time::timeout(Duration::from_secs(5), recovered.read_to_end(1024))
+                .await
+                .expect("recovery TCP echo timeout")
+                .expect("read recovery TCP payload");
+            assert_eq!(echoed, payload);
+            let request = tokio::time::timeout(Duration::from_secs(2), proxy_requests.recv())
+                .await
+                .expect("recovery SOCKS5 CONNECT request timeout")
+                .expect("recovery request channel closed");
+            assert_eq!(request.target, echo_addr);
+            assert!(process.is_running().expect("poll recovered server process"));
+
+            drop(recovered);
+            echo.shutdown().await.expect("shutdown TCP echo fixture");
+            let exit = process
+                .terminate(Duration::from_secs(2))
+                .expect("terminate zuicity-server run");
+            assert_managed_server_terminated(&exit, &log_path);
+            tokio::time::timeout(Duration::from_secs(2), proxy_task)
+                .await
+                .expect("silent-then-ready SOCKS5 proxy shutdown timeout")
+                .expect("join silent-then-ready SOCKS5 proxy")
+                .expect("silent-then-ready SOCKS5 proxy ok");
+        });
+}
+
+#[test]
+fn server_run_rejects_conflicting_outbound_and_dialer_link() {
+    let artifact = zuicity_testkit::artifact_dir("cli server outbound conflict")
+        .create()
+        .expect("create artifact dir");
+    let config = artifact.path().join("server.json");
+    write_config(
+        config.to_str().expect("utf8 config path"),
+        r#"{"listen":"127.0.0.1:0","users":{"00000000-0000-0000-0000-000000000001":"password"},"certificate":"/tmp/unused-fullchain.pem","private_key":"/tmp/unused-private.key","dialer_link":"socks5://127.0.0.1:1","outbound":{"type":"socks5","server":"127.0.0.1","server_port":10808},"log_level":"debug"}"#,
+    );
+    let output = run_bin(
+        "zuicity-server",
+        &["run", "-c", config.to_str().expect("utf8 config path")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("FTL"), "output={combined:?}");
+    assert!(
+        combined.contains("outbound and dialer_link conflict")
+            || combined.contains("choose one egress setting"),
+        "output={combined:?}"
+    );
+    assert!(
+        !combined.contains("Failed to read config"),
+        "output={combined:?}"
+    );
 }
 
 #[test]

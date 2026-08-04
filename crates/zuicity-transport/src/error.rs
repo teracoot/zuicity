@@ -152,6 +152,12 @@ pub enum TransportError {
         /// Failure message.
         message: String,
     },
+    /// SOCKS5 endpoint setup did not complete before the bounded deadline.
+    #[error("SOCKS5 proxy setup timed out after {timeout:?}")]
+    Socks5SetupTimedOut {
+        /// Total DNS, TCP connect, and SOCKS handshake deadline.
+        timeout: std::time::Duration,
+    },
     /// Domain target bytes were not valid UTF-8.
     #[error("domain proxy target is not valid UTF-8: {0}")]
     InvalidDomainTarget(#[from] std::str::Utf8Error),

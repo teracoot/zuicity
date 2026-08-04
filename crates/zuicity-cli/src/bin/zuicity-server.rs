@@ -324,7 +324,7 @@ fn split_listen_port(value: &str) -> Result<(&str, &str), &'static str> {
 }
 
 fn run_server(args: LogArgs) -> anyhow::Result<()> {
-    let raw_config = match load_server_raw_config(&args) {
+    let mut raw_config = match load_server_raw_config(&args) {
         Ok(config) => config,
         Err(err) => fatal_server_config_error(&err),
     };
@@ -332,6 +332,14 @@ fn run_server(args: LogArgs) -> anyhow::Result<()> {
         Ok(logger) => logger,
         Err(err) => fatal_server_logger_init_error(&err.to_string()),
     };
+    if let Err(err) = zuicity_config::apply_server_outbound_env_overrides(&mut raw_config) {
+        match err {
+            ConfigError::InvalidOutbound(message) => {
+                fatal_server_serve_error(&mut logger, &format!("invalid outbound: {message}"))
+            }
+            other => fatal_server_config_error(&other.to_string()),
+        }
+    }
     let config = match validate_server(raw_config) {
         Ok(config) => config,
         Err(ConfigError::InvalidUserUuid { uuid, .. }) => {
@@ -344,6 +352,13 @@ fn run_server(args: LogArgs) -> anyhow::Result<()> {
         Err(ConfigError::InvalidSendThrough { value, .. }) => fatal_server_serve_error(
             &mut logger,
             &format_upstream_send_through_parse_error(&value),
+        ),
+        Err(ConfigError::InvalidOutbound(message)) => {
+            fatal_server_serve_error(&mut logger, &format!("invalid outbound: {message}"))
+        }
+        Err(ConfigError::ConflictingOutboundAndDialerLink) => fatal_server_serve_error(
+            &mut logger,
+            "outbound and dialer_link conflict: choose one egress setting",
         ),
         Err(err) => fatal_server_config_error(&err.to_string()),
     };

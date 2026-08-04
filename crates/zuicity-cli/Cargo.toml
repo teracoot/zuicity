@@ -37,6 +37,7 @@ x509-parser.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+serde_json.workspace = true
 zuicity-testkit = { path = "../zuicity-testkit" }
 rcgen.workspace = true
 uuid.workspace = true

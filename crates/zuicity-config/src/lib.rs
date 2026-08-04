@@ -45,6 +45,33 @@ impl CongestionControl {
     }
 }
 
+/// Optional structured server outbound (egress) configuration.
+///
+/// This is a zuicity extension for operator-friendly SOCKS5 upstream VPN
+/// selection. When present, it is normalized into the existing high-performance
+/// `dialer_link` path so the relay hot path is unchanged.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawOutboundConfig {
+    /// Outbound type. Currently only `socks5` is accepted.
+    #[serde(default, rename = "type")]
+    pub outbound_type: String,
+    /// Upstream SOCKS5 host or IP.
+    #[serde(default)]
+    pub server: String,
+    /// Upstream SOCKS5 port.
+    #[serde(default)]
+    pub server_port: Option<u16>,
+    /// Optional SOCKS5 username.
+    #[serde(default)]
+    pub username: String,
+    /// Optional SOCKS5 password.
+    #[serde(default)]
+    pub password: String,
+    /// SOCKS version string. Empty or `5` are accepted.
+    #[serde(default)]
+    pub version: String,
+}
+
 /// Raw upstream JSON config shape. Upstream uses one struct for client and server fields.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RawConfig {
@@ -90,6 +117,9 @@ pub struct RawConfig {
     /// Server egress dialer link.
     #[serde(default)]
     pub dialer_link: String,
+    /// Optional structured server outbound config (zuicity extension).
+    #[serde(default)]
+    pub outbound: Option<RawOutboundConfig>,
     /// Client protect path.
     #[serde(default)]
     pub protect_path: String,
@@ -143,6 +173,8 @@ pub struct ServerConfig {
     pub fwmark: Option<u32>,
     /// Parsed egress source IP, if configured.
     pub send_through: Option<IpAddr>,
+    /// Effective server egress dialer link after outbound normalization.
+    pub dialer_link: Option<String>,
 }
 
 impl ClientConfig {
@@ -236,6 +268,12 @@ pub enum ConfigError {
         /// Underlying IP parse error.
         source: AddrParseError,
     },
+    /// Structured outbound config is invalid.
+    #[error("invalid outbound: {0}")]
+    InvalidOutbound(String),
+    /// Both `outbound` and `dialer_link` were set to different values.
+    #[error("outbound and dialer_link conflict: choose one egress setting")]
+    ConflictingOutboundAndDialerLink,
 }
 
 /// Loads raw JSON config from a file.
@@ -284,6 +322,220 @@ pub fn validate_client(raw: RawConfig) -> Result<ClientConfig, ConfigError> {
     })
 }
 
+/// Applies optional environment overrides for server SOCKS5 outbound.
+///
+/// Supported variables:
+/// - `ZUICITY_OUTBOUND_TYPE`
+/// - `ZUICITY_OUTBOUND_SERVER`
+/// - `ZUICITY_OUTBOUND_PORT`
+/// - `ZUICITY_OUTBOUND_USERNAME`
+/// - `ZUICITY_OUTBOUND_PASSWORD`
+///
+/// Existing explicit JSON `outbound` fields win over env values. Non-empty env
+/// values only fill missing structured outbound fields; empty values are treated
+/// as unset and do not enable outbound mode.
+pub fn apply_server_outbound_env_overrides(raw: &mut RawConfig) -> Result<(), ConfigError> {
+    apply_server_outbound_env_values(
+        raw,
+        ServerOutboundEnvValues {
+            outbound_type: std::env::var("ZUICITY_OUTBOUND_TYPE").ok(),
+            server: std::env::var("ZUICITY_OUTBOUND_SERVER").ok(),
+            port: std::env::var("ZUICITY_OUTBOUND_PORT").ok(),
+            username: std::env::var("ZUICITY_OUTBOUND_USERNAME").ok(),
+            password: std::env::var("ZUICITY_OUTBOUND_PASSWORD").ok(),
+        },
+    )
+}
+
+#[derive(Default)]
+struct ServerOutboundEnvValues {
+    outbound_type: Option<String>,
+    server: Option<String>,
+    port: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn apply_server_outbound_env_values(
+    raw: &mut RawConfig,
+    values: ServerOutboundEnvValues,
+) -> Result<(), ConfigError> {
+    let ServerOutboundEnvValues {
+        outbound_type: env_type,
+        server: env_server,
+        port: env_port,
+        username: env_username,
+        password: env_password,
+    } = values;
+    let env_type = non_empty_env_value(env_type);
+    let env_server = non_empty_env_value(env_server);
+    let env_port = non_empty_env_value(env_port);
+    let env_username = non_empty_env_value(env_username);
+    let env_password = non_empty_env_value(env_password);
+    if env_type.is_none()
+        && env_server.is_none()
+        && env_port.is_none()
+        && env_username.is_none()
+        && env_password.is_none()
+    {
+        return Ok(());
+    }
+
+    let outbound = raw.outbound.get_or_insert_with(RawOutboundConfig::default);
+    if outbound.outbound_type.is_empty()
+        && let Some(value) = env_type
+    {
+        outbound.outbound_type = value;
+    }
+    if outbound.server.is_empty()
+        && let Some(value) = env_server
+    {
+        outbound.server = value;
+    }
+    if outbound.server_port.is_none()
+        && let Some(value) = env_port
+    {
+        let port = value.parse::<u16>().map_err(|_| {
+            ConfigError::InvalidOutbound(
+                "ZUICITY_OUTBOUND_PORT must be an integer from 1 through 65535".to_owned(),
+            )
+        })?;
+        if port == 0 {
+            return Err(ConfigError::InvalidOutbound(
+                "ZUICITY_OUTBOUND_PORT must be an integer from 1 through 65535".to_owned(),
+            ));
+        }
+        outbound.server_port = Some(port);
+    }
+    if outbound.username.is_empty()
+        && let Some(value) = env_username
+    {
+        outbound.username = value;
+    }
+    if outbound.password.is_empty()
+        && let Some(value) = env_password
+    {
+        outbound.password = value;
+    }
+    Ok(())
+}
+
+fn non_empty_env_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// Builds a SOCKS5 `dialer_link` from structured outbound config.
+pub fn socks5_dialer_link_from_outbound(
+    outbound: &RawOutboundConfig,
+) -> Result<String, ConfigError> {
+    let outbound_type = if outbound.outbound_type.is_empty() {
+        "socks5"
+    } else {
+        outbound.outbound_type.as_str()
+    };
+    if !outbound_type.eq_ignore_ascii_case("socks5") && outbound_type != "5" {
+        return Err(ConfigError::InvalidOutbound(format!(
+            "unsupported type `{outbound_type}`; only socks5 is supported"
+        )));
+    }
+    if !outbound.version.is_empty() && outbound.version != "5" {
+        return Err(ConfigError::InvalidOutbound(format!(
+            "unsupported version `{}`; only 5 is supported",
+            outbound.version
+        )));
+    }
+    if outbound.server.trim().is_empty() {
+        return Err(ConfigError::InvalidOutbound(
+            "server is required".to_owned(),
+        ));
+    }
+    let port = outbound
+        .server_port
+        .ok_or_else(|| ConfigError::InvalidOutbound("server_port is required".to_owned()))?;
+    if port == 0 {
+        return Err(ConfigError::InvalidOutbound(
+            "server_port must be non-zero".to_owned(),
+        ));
+    }
+
+    let host = outbound.server.trim();
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let endpoint = url::Url::parse(&format!("socks5://{authority}:{port}")).map_err(|_| {
+        ConfigError::InvalidOutbound("server must be a valid hostname or IP address".to_owned())
+    })?;
+    if endpoint.host_str().is_none()
+        || endpoint.port() != Some(port)
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidOutbound(
+            "server must be a valid hostname or IP address".to_owned(),
+        ));
+    }
+
+    if outbound.username.len() > u8::MAX as usize || outbound.password.len() > u8::MAX as usize {
+        return Err(ConfigError::InvalidOutbound(
+            "SOCKS5 username and password must each be at most 255 bytes".to_owned(),
+        ));
+    }
+
+    let userinfo = match (outbound.username.is_empty(), outbound.password.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("{}@", percent_encode_userinfo(&outbound.username)),
+        (true, false) => {
+            return Err(ConfigError::InvalidOutbound(
+                "password requires username".to_owned(),
+            ));
+        }
+        (false, false) => format!(
+            "{}:{}@",
+            percent_encode_userinfo(&outbound.username),
+            percent_encode_userinfo(&outbound.password)
+        ),
+    };
+
+    Ok(format!("socks5://{userinfo}{authority}:{port}"))
+}
+
+fn percent_encode_userinfo(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn resolve_server_dialer_link(raw: &RawConfig) -> Result<Option<String>, ConfigError> {
+    let from_outbound = raw
+        .outbound
+        .as_ref()
+        .map(socks5_dialer_link_from_outbound)
+        .transpose()?;
+    let from_dialer_link = (!raw.dialer_link.is_empty()).then(|| raw.dialer_link.clone());
+    match (from_outbound, from_dialer_link) {
+        (None, None) => Ok(None),
+        (Some(link), None) | (None, Some(link)) => Ok(Some(link)),
+        (Some(outbound_link), Some(dialer_link)) => {
+            if outbound_link == dialer_link {
+                Ok(Some(outbound_link))
+            } else {
+                Err(ConfigError::ConflictingOutboundAndDialerLink)
+            }
+        }
+    }
+}
+
 /// Validates raw config for server mode.
 pub fn validate_server(raw: RawConfig) -> Result<ServerConfig, ConfigError> {
     let mut users = BTreeMap::new();
@@ -315,12 +567,20 @@ pub fn validate_server(raw: RawConfig) -> Result<ServerConfig, ConfigError> {
             }
         })?)
     };
+    let dialer_link = resolve_server_dialer_link(&raw)?;
+    let mut raw = raw;
+    if let Some(link) = dialer_link.as_ref() {
+        // Keep raw.dialer_link filled so existing consumers and logs see the
+        // effective high-performance dial path after outbound normalization.
+        raw.dialer_link = link.clone();
+    }
     Ok(ServerConfig {
         raw,
         users,
         congestion_control,
         fwmark,
         send_through,
+        dialer_link,
     })
 }
 
@@ -808,6 +1068,278 @@ mod tests {
         let config = validate_server(raw)?;
         assert_eq!(config.users.len(), 1);
         assert_eq!(config.fwmark, Some(0x1000));
+        assert_eq!(config.dialer_link, None);
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_socks5_normalizes_to_dialer_link() -> Result<(), ConfigError> {
+        let raw = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "outbound": {
+                "type": "socks5",
+                "server": "127.0.0.1",
+                "server_port": 10808
+              }
+            }"#,
+        )?;
+        let config = validate_server(raw)?;
+        assert_eq!(
+            config.dialer_link.as_deref(),
+            Some("socks5://127.0.0.1:10808")
+        );
+        assert_eq!(config.raw.dialer_link, "socks5://127.0.0.1:10808");
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_socks5_encodes_auth_and_ipv6_host() -> Result<(), ConfigError> {
+        let raw = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "outbound": {
+                "type": "socks5",
+                "server": "::1",
+                "server_port": 1080,
+                "username": "user name",
+                "password": "p@ss:word"
+              }
+            }"#,
+        )?;
+        let config = validate_server(raw)?;
+        assert_eq!(
+            config.dialer_link.as_deref(),
+            Some("socks5://user%20name:p%40ss%3Aword@[::1]:1080")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_and_matching_dialer_link_are_accepted() -> Result<(), ConfigError> {
+        let raw = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "dialer_link": "socks5://127.0.0.1:10808",
+              "outbound": {
+                "type": "socks5",
+                "server": "127.0.0.1",
+                "server_port": 10808
+              }
+            }"#,
+        )?;
+        let config = validate_server(raw)?;
+        assert_eq!(
+            config.dialer_link.as_deref(),
+            Some("socks5://127.0.0.1:10808")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_and_conflicting_dialer_link_are_rejected() {
+        let raw = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "dialer_link": "socks5://127.0.0.1:1",
+              "outbound": {
+                "type": "socks5",
+                "server": "127.0.0.1",
+                "server_port": 10808
+              }
+            }"#,
+        )
+        .expect("decode");
+        let err = validate_server(raw).unwrap_err();
+        assert!(matches!(err, ConfigError::ConflictingOutboundAndDialerLink));
+    }
+
+    #[test]
+    fn server_outbound_rejects_missing_port_and_unsupported_type() {
+        let missing_port = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "outbound": {"type":"socks5","server":"127.0.0.1"}
+            }"#,
+        )
+        .expect("decode");
+        assert!(matches!(
+            validate_server(missing_port).unwrap_err(),
+            ConfigError::InvalidOutbound(_)
+        ));
+
+        let zero_port = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "outbound": {"type":"socks5","server":"127.0.0.1","server_port":0}
+            }"#,
+        )
+        .expect("decode");
+        assert!(matches!(
+            validate_server(zero_port).unwrap_err(),
+            ConfigError::InvalidOutbound(message) if message.contains("non-zero")
+        ));
+
+        let bad_type = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "users": {"00000000-0000-0000-0000-000000000000": "my_password"},
+              "certificate": "/path/to/fullchain.cer",
+              "private_key": "/path/to/private.key",
+              "outbound": {"type":"http","server":"127.0.0.1","server_port":8080}
+            }"#,
+        )
+        .expect("decode");
+        assert!(matches!(
+            validate_server(bad_type).unwrap_err(),
+            ConfigError::InvalidOutbound(_)
+        ));
+    }
+
+    #[test]
+    fn server_outbound_rejects_malformed_hosts_and_oversized_credentials() {
+        for host in ["user@proxy.example", "proxy.example/path", "host:1080"] {
+            let raw = load_json_str(&format!(
+                r#"{{"listen":":23182","outbound":{{"server":"{host}","server_port":1080}}}}"#
+            ))
+            .expect("decode");
+            assert!(
+                matches!(validate_server(raw).unwrap_err(), ConfigError::InvalidOutbound(message) if message.contains("hostname or IP")),
+                "host {host} must fail"
+            );
+        }
+
+        for (field, value) in [("username", "u".repeat(256)), ("password", "p".repeat(256))] {
+            let raw = load_json_str(&format!(
+                r#"{{"listen":":23182","outbound":{{"server":"127.0.0.1","server_port":1080,"username":"user","{field}":"{value}"}}}}"#
+            ))
+            .expect("decode");
+            assert!(
+                matches!(validate_server(raw).unwrap_err(), ConfigError::InvalidOutbound(message) if message.contains("255 bytes")),
+                "field {field} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn server_outbound_env_only_normalizes_to_dialer_link() -> Result<(), ConfigError> {
+        let mut raw = RawConfig::default();
+        apply_server_outbound_env_values(
+            &mut raw,
+            ServerOutboundEnvValues {
+                outbound_type: Some("socks5".to_owned()),
+                server: Some("localhost".to_owned()),
+                port: Some("10808".to_owned()),
+                username: Some("vpn user".to_owned()),
+                password: Some("p@ss:word".to_owned()),
+            },
+        )?;
+
+        let config = validate_server(raw)?;
+        assert_eq!(
+            config.dialer_link.as_deref(),
+            Some("socks5://vpn%20user:p%40ss%3Aword@localhost:10808")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_empty_env_values_preserve_direct_mode() -> Result<(), ConfigError> {
+        let mut raw = RawConfig::default();
+        apply_server_outbound_env_values(
+            &mut raw,
+            ServerOutboundEnvValues {
+                outbound_type: Some(String::new()),
+                server: Some(String::new()),
+                port: Some(String::new()),
+                username: Some(String::new()),
+                password: Some(String::new()),
+            },
+        )?;
+
+        assert!(raw.outbound.is_none());
+        assert_eq!(validate_server(raw)?.dialer_link, None);
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_json_values_take_precedence_over_env() -> Result<(), ConfigError> {
+        let mut raw = load_json_str(
+            r#"{
+              "listen": ":23182",
+              "outbound": {
+                "type":"socks5",
+                "server":"127.0.0.1",
+                "server_port":1080,
+                "username":"json-user",
+                "password":"json-password"
+              }
+            }"#,
+        )?;
+        apply_server_outbound_env_values(
+            &mut raw,
+            ServerOutboundEnvValues {
+                outbound_type: Some("http".to_owned()),
+                server: Some("proxy.example".to_owned()),
+                port: Some("not-a-port".to_owned()),
+                username: Some("env-user".to_owned()),
+                password: Some("env-password".to_owned()),
+            },
+        )?;
+
+        assert_eq!(
+            validate_server(raw)?.dialer_link.as_deref(),
+            Some("socks5://json-user:json-password@127.0.0.1:1080")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_outbound_env_rejects_invalid_ports() {
+        for value in ["0", "65536", "not-a-port"] {
+            let mut raw = RawConfig::default();
+            let error = apply_server_outbound_env_values(
+                &mut raw,
+                ServerOutboundEnvValues {
+                    server: Some("127.0.0.1".to_owned()),
+                    port: Some(value.to_owned()),
+                    ..ServerOutboundEnvValues::default()
+                },
+            )
+            .expect_err("invalid env port must fail");
+            assert!(
+                matches!(error, ConfigError::InvalidOutbound(ref message) if message.contains("ZUICITY_OUTBOUND_PORT")),
+                "port {value}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn socks5_dialer_link_builder_defaults_type_to_socks5() -> Result<(), ConfigError> {
+        let outbound = RawOutboundConfig {
+            server: "127.0.0.1".to_owned(),
+            server_port: Some(10808),
+            ..RawOutboundConfig::default()
+        };
+        assert_eq!(
+            socks5_dialer_link_from_outbound(&outbound)?,
+            "socks5://127.0.0.1:10808"
+        );
         Ok(())
     }
 }

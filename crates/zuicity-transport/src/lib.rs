@@ -117,6 +117,12 @@ pub use vmess_dialer::VmessDialerLink;
 /// application has not accepted yet.
 pub const MAX_PENDING_SERVER_AUTHENTICATIONS: usize = 128;
 
+/// Total deadline for resolving, connecting to, and negotiating a SOCKS5 endpoint.
+///
+/// This bounds session state retained by an endpoint that accepts TCP but never
+/// completes method selection, authentication, `CONNECT`, or `UDP ASSOCIATE`.
+pub const SOCKS5_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Aggregate stream bytes an unauthenticated peer may hold in Quinn receive
 /// buffers. Authenticated connections are raised to their configured policy.
 pub const PRE_AUTHENTICATION_RECEIVE_WINDOW: u64 = 64 * 1024;
@@ -1765,6 +1771,24 @@ async fn connect_tcp_proxy_target_with_dialer_link(
 }
 
 async fn connect_tcp_proxy_target_via_dialer_chain(
+    header: &OwnedProxyHeader,
+    egress: &ProxyEgressPolicy,
+    links: &[ProxyDialerLink],
+) -> Result<TcpProxyTargetStream, TransportError> {
+    if links
+        .iter()
+        .any(|link| matches!(link, ProxyDialerLink::Socks5(_)))
+    {
+        return socks5_setup_with_timeout(
+            SOCKS5_SETUP_TIMEOUT,
+            connect_tcp_proxy_target_via_dialer_chain_inner(header, egress, links),
+        )
+        .await;
+    }
+    connect_tcp_proxy_target_via_dialer_chain_inner(header, egress, links).await
+}
+
+async fn connect_tcp_proxy_target_via_dialer_chain_inner(
     header: &OwnedProxyHeader,
     egress: &ProxyEgressPolicy,
     links: &[ProxyDialerLink],
@@ -3850,6 +3874,28 @@ async fn connect_tcp_proxy_target_via_socks5(
     egress: &ProxyEgressPolicy,
     link: &Socks5DialerLink,
 ) -> Result<TcpProxyTargetStream, TransportError> {
+    connect_tcp_proxy_target_via_socks5_with_timeout(header, egress, link, SOCKS5_SETUP_TIMEOUT)
+        .await
+}
+
+async fn connect_tcp_proxy_target_via_socks5_with_timeout(
+    header: &OwnedProxyHeader,
+    egress: &ProxyEgressPolicy,
+    link: &Socks5DialerLink,
+    timeout: Duration,
+) -> Result<TcpProxyTargetStream, TransportError> {
+    socks5_setup_with_timeout(
+        timeout,
+        connect_tcp_proxy_target_via_socks5_inner(header, egress, link),
+    )
+    .await
+}
+
+async fn connect_tcp_proxy_target_via_socks5_inner(
+    header: &OwnedProxyHeader,
+    egress: &ProxyEgressPolicy,
+    link: &Socks5DialerLink,
+) -> Result<TcpProxyTargetStream, TransportError> {
     let proxy_targets = tokio::net::lookup_host((link.host.as_str(), link.port)).await?;
     let proxy_egress =
         ProxyEgressPolicy::with_send_through_and_fwmark(egress.send_through, egress.fwmark);
@@ -4709,6 +4755,21 @@ async fn connect_socks5_udp_association(
     egress: &ProxyEgressPolicy,
     link: &Socks5DialerLink,
 ) -> Result<Socks5UdpAssociation, TransportError> {
+    connect_socks5_udp_association_with_timeout(egress, link, SOCKS5_SETUP_TIMEOUT).await
+}
+
+async fn connect_socks5_udp_association_with_timeout(
+    egress: &ProxyEgressPolicy,
+    link: &Socks5DialerLink,
+    timeout: Duration,
+) -> Result<Socks5UdpAssociation, TransportError> {
+    socks5_setup_with_timeout(timeout, connect_socks5_udp_association_inner(egress, link)).await
+}
+
+async fn connect_socks5_udp_association_inner(
+    egress: &ProxyEgressPolicy,
+    link: &Socks5DialerLink,
+) -> Result<Socks5UdpAssociation, TransportError> {
     let proxy_targets = tokio::net::lookup_host((link.host.as_str(), link.port)).await?;
     let proxy_egress =
         ProxyEgressPolicy::with_send_through_and_fwmark(egress.send_through, egress.fwmark);
@@ -4742,6 +4803,18 @@ async fn connect_socks5_udp_association(
 }
 
 async fn connect_socks5_udp_association_via_shadowsocks(
+    egress: &ProxyEgressPolicy,
+    socks5: &Socks5DialerLink,
+    shadowsocks: &ShadowsocksDialerLink,
+) -> Result<Socks5UdpAssociation, TransportError> {
+    socks5_setup_with_timeout(
+        SOCKS5_SETUP_TIMEOUT,
+        connect_socks5_udp_association_via_shadowsocks_inner(egress, socks5, shadowsocks),
+    )
+    .await
+}
+
+async fn connect_socks5_udp_association_via_shadowsocks_inner(
     egress: &ProxyEgressPolicy,
     socks5: &Socks5DialerLink,
     shadowsocks: &ShadowsocksDialerLink,
@@ -4796,6 +4869,15 @@ async fn connect_socks5_udp_association_via_shadowsocks(
         return Err(error);
     }
     Err(TransportError::NoUsableUdpTarget)
+}
+
+async fn socks5_setup_with_timeout<T>(
+    timeout: Duration,
+    setup: impl std::future::Future<Output = Result<T, TransportError>>,
+) -> Result<T, TransportError> {
+    tokio::time::timeout(timeout, setup)
+        .await
+        .map_err(|_| TransportError::Socks5SetupTimedOut { timeout })?
 }
 
 async fn relay_udp_payload_to_target_via_trojan(
@@ -9957,6 +10039,28 @@ mod tests {
     }
 
     #[test]
+    fn socks_dialer_link_decodes_percent_encoded_credentials() -> Result<(), TransportError> {
+        let parsed = ProxyDialerLink::parse("socks5://vpn%20user:p%40ss%3Aword@127.0.0.1:1080")?;
+        let ProxyDialerLink::Socks5(parsed) = parsed else {
+            panic!("expected SOCKS5 dialer link");
+        };
+        assert_eq!(parsed.username.as_deref(), Some("vpn user"));
+        assert_eq!(parsed.password.as_deref(), Some("p@ss:word"));
+        Ok(())
+    }
+
+    #[test]
+    fn socks_dialer_link_normalizes_ipv6_host_for_dns_resolution() -> Result<(), TransportError> {
+        let parsed = ProxyDialerLink::parse("socks5://[::1]:1080")?;
+        let ProxyDialerLink::Socks5(parsed) = parsed else {
+            panic!("expected SOCKS5 dialer link");
+        };
+        assert_eq!(parsed.host, "::1");
+        assert_eq!(parsed.port, 1080);
+        Ok(())
+    }
+
+    #[test]
     fn trojan_dialer_link_parses_registered_tcp_schemes_and_rejects_unsupported_transports()
     -> Result<(), TransportError> {
         for raw in [
@@ -11254,6 +11358,128 @@ mod tests {
         assert_eq!(echoed, b"socks5 dialer link tcp");
         drop(stream);
         proxy_task.await??;
+        echo.shutdown().await.expect("shutdown TCP echo fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_tcp_setup_timeout_closes_socket_and_next_session_recovers()
+    -> Result<(), TransportError> {
+        let echo = zuicity_testkit::TcpEchoServer::start()
+            .await
+            .expect("start TCP echo fixture");
+        let echo_addr = echo.local_addr();
+        let (proxy_addr, mut requests, proxy_task) =
+            zuicity_testkit::start_socks5_tcp_connect_proxy_after_silent_connection()
+                .await
+                .expect("start silent-then-ready SOCKS5 proxy");
+        let header = OwnedProxyHeader::from_ip(Network::Tcp, echo_addr.ip(), echo_addr.port());
+        let ProxyDialerLink::Socks5(link) =
+            ProxyDialerLink::parse(&format!("socks5://{proxy_addr}"))?
+        else {
+            unreachable!("SOCKS5 link must parse as SOCKS5");
+        };
+        let timeout = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+
+        let error = match connect_tcp_proxy_target_via_socks5_with_timeout(
+            &header,
+            &ProxyEgressPolicy::direct(),
+            &link,
+            timeout,
+        )
+        .await
+        {
+            Ok(_) => panic!("silent SOCKS5 TCP setup must time out"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TransportError::Socks5SetupTimedOut { timeout: actual } if actual == timeout
+        ));
+        assert!(started.elapsed() >= timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let mut stream = connect_tcp_proxy_target_via_socks5_with_timeout(
+            &header,
+            &ProxyEgressPolicy::direct(),
+            &link,
+            Duration::from_secs(2),
+        )
+        .await?;
+        let request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("recovery SOCKS5 CONNECT request timeout")
+            .expect("recovery request channel closed");
+        assert_eq!(request.target, echo_addr);
+        stream.write_all(b"SOCKS5 timeout recovery").await?;
+        let mut echoed = vec![0_u8; b"SOCKS5 timeout recovery".len()];
+        stream.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, b"SOCKS5 timeout recovery");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("silent-then-ready SOCKS5 proxy shutdown timeout")??;
+        echo.shutdown().await.expect("shutdown TCP echo fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_setup_timeout_closes_control_socket() -> Result<(), TransportError>
+    {
+        let echo = zuicity_testkit::TcpEchoServer::start()
+            .await
+            .expect("start TCP echo fixture");
+        let echo_addr = echo.local_addr();
+        let (proxy_addr, mut requests, proxy_task) =
+            zuicity_testkit::start_socks5_tcp_connect_proxy_after_silent_connection()
+                .await
+                .expect("start silent-then-ready SOCKS5 proxy");
+        let ProxyDialerLink::Socks5(link) =
+            ProxyDialerLink::parse(&format!("socks5://{proxy_addr}"))?
+        else {
+            unreachable!("SOCKS5 link must parse as SOCKS5");
+        };
+        let timeout = Duration::from_millis(150);
+
+        let error = match connect_socks5_udp_association_with_timeout(
+            &ProxyEgressPolicy::direct(),
+            &link,
+            timeout,
+        )
+        .await
+        {
+            Ok(_) => panic!("silent SOCKS5 UDP ASSOCIATE setup must time out"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TransportError::Socks5SetupTimedOut { timeout: actual } if actual == timeout
+        ));
+
+        let header = OwnedProxyHeader::from_ip(Network::Tcp, echo_addr.ip(), echo_addr.port());
+        let mut stream = connect_tcp_proxy_target_via_socks5_with_timeout(
+            &header,
+            &ProxyEgressPolicy::direct(),
+            &link,
+            Duration::from_secs(2),
+        )
+        .await?;
+        let request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("post-UDP-timeout SOCKS5 CONNECT request timeout")
+            .expect("post-UDP-timeout request channel closed");
+        assert_eq!(request.target, echo_addr);
+        stream.write_all(b"UDP setup timeout recovery").await?;
+        let mut echoed = vec![0_u8; b"UDP setup timeout recovery".len()];
+        stream.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, b"UDP setup timeout recovery");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("silent-then-ready SOCKS5 proxy shutdown timeout")??;
         echo.shutdown().await.expect("shutdown TCP echo fixture");
         Ok(())
     }

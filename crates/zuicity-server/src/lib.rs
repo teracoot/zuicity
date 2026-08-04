@@ -88,8 +88,9 @@ impl ServerEgressPolicy {
             block_underlay_udp443: config.raw.disable_outbound_udp443,
             send_through: config.send_through,
             fwmark: config.fwmark,
-            dialer_link: (!config.raw.dialer_link.is_empty())
-                .then(|| config.raw.dialer_link.clone()),
+            dialer_link: config.dialer_link.clone().or_else(|| {
+                (!config.raw.dialer_link.is_empty()).then(|| config.raw.dialer_link.clone())
+            }),
         }
     }
 
@@ -1274,7 +1275,9 @@ fn proxy_target_open_failed(error: &zuicity_transport::TransportError) -> bool {
     use zuicity_transport::TransportError;
     matches!(
         error,
-        TransportError::NoUsableTcpTarget | TransportError::NoUsableUdpTarget
+        TransportError::NoUsableTcpTarget
+            | TransportError::NoUsableUdpTarget
+            | TransportError::Socks5SetupTimedOut { .. }
     ) || matches!(error, TransportError::Io(source) if io_error_is_target_open_failure(source))
 }
 
@@ -3412,6 +3415,185 @@ mod tests {
         drop(stream);
         proxy_task.await??;
         echo.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_runtime_routes_tcp_target_through_outbound_socks5_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "runtime outbound socks5 tcp password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])?;
+        let echo = zuicity_testkit::TcpEchoServer::start().await?;
+        let (proxy_addr, mut requests, proxy_task) = start_socks5_tcp_connect_proxy().await?;
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","outbound":{{"type":"socks5","server":"{}","server_port":{}}},"users":{{"{uuid}":"{password}"}}}}"#,
+            proxy_addr.ip(),
+            proxy_addr.port()
+        ))?);
+        assert_eq!(
+            runtime.config().config.dialer_link.as_deref(),
+            Some(format!("socks5://{proxy_addr}").as_str())
+        );
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let server_task = tokio::spawn(async move { bound.accept_one_tcp_proxy().await });
+
+        let client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "server.local",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            )
+            .await?;
+        let echo_addr = echo.local_addr();
+        let mut stream = connection
+            .open_tcp_proxy_stream(echo_addr.ip(), echo_addr.port())
+            .await?;
+        stream
+            .write_all(b"server runtime outbound socks5 tcp")
+            .await?;
+        stream.finish()?;
+        let echoed = stream.read_to_end(1024).await?;
+        assert_eq!(echoed, b"server runtime outbound socks5 tcp");
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv())
+            .await
+            .expect("SOCKS5 proxy did not receive outbound-block CONNECT")
+            .expect("SOCKS5 proxy request channel closed");
+        assert_eq!(request.target, echo_addr);
+        let report = server_task.await??;
+        assert_eq!(report.target, proxy_addr);
+        drop(stream);
+        proxy_task.await??;
+        echo.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_runtime_routes_udp_target_through_outbound_socks5_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "runtime outbound socks5 udp password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])?;
+        let echo = zuicity_testkit::UdpEchoServer::start().await?;
+        let (proxy_addr, mut requests, proxy_task) =
+            zuicity_testkit::start_socks5_udp_associate_proxy().await?;
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","outbound":{{"type":"socks5","server":"{}","server_port":{}}},"users":{{"{uuid}":"{password}"}}}}"#,
+            proxy_addr.ip(),
+            proxy_addr.port()
+        ))?);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let server_task = tokio::spawn(async move { bound.accept_one_udp_over_stream().await });
+
+        let client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "server.local",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            )
+            .await?;
+        let echo_addr = echo.local_addr();
+        let mut stream = connection
+            .open_udp_over_stream(echo_addr.ip(), echo_addr.port())
+            .await?;
+        stream
+            .send_datagram(b"server runtime outbound socks5 udp")
+            .await?;
+        let echoed = stream.recv_datagram(1024).await?;
+        assert_eq!(echoed.target, echo_addr);
+        assert_eq!(echoed.payload, b"server runtime outbound socks5 udp");
+        stream.finish()?;
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv())
+            .await
+            .expect("SOCKS5 proxy did not receive outbound-block UDP associate")
+            .expect("SOCKS5 proxy request channel closed");
+        assert_eq!(request.target, echo_addr);
+        let report = server_task.await??;
+        assert_eq!(report.target, echo_addr);
+        proxy_task.await??;
+        echo.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_runtime_outbound_socks5_failure_is_session_local()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let uuid = uuid::Uuid::new_v4();
+        let password = "runtime outbound socks5 failure password";
+        let cert = rcgen::generate_simple_self_signed(vec!["server.local".to_owned()])?;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let closed_addr = closed.local_addr()?;
+        drop(closed);
+        let runtime = ServerRuntime::new(server_config(&format!(
+            r#"{{"listen":"127.0.0.1:0","outbound":{{"type":"socks5","server":"{}","server_port":{}}},"users":{{"{uuid}":"{password}"}}}}"#,
+            closed_addr.ip(),
+            closed_addr.port()
+        ))?);
+        let bound = runtime.bind_with_pem(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )?;
+        let server_addr = bound.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            bound
+                .run_proxy_loop_until(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "server.local",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password.as_bytes(),
+            )
+            .await?;
+        let mut stream = connection
+            .open_tcp_proxy_stream(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9)
+            .await?;
+        let write_result = stream.write_all(b"should-not-reach-target").await;
+        let read_result = stream.read_to_end(64).await;
+        assert!(
+            write_result.is_err()
+                || read_result.is_err()
+                || read_result.as_ref().is_ok_and(Vec::is_empty),
+            "unreachable SOCKS5 outbound must fail the proxy session, write={write_result:?} read={read_result:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !server_task.is_finished(),
+            "unreachable SOCKS5 outbound must not terminate the proxy loop"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        server_task.await??;
         Ok(())
     }
 
@@ -5681,6 +5863,26 @@ mod tests {
             transport_policy.dialer_link,
             Some(zuicity_transport::ProxyDialerLink::Socks5(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn egress_policy_maps_outbound_socks5_block_to_transport_policy() -> Result<(), ServerError> {
+        let runtime = server_config(
+            r#"{"listen":":23182","outbound":{"type":"socks5","server":"127.0.0.1","server_port":10808}}"#,
+        )?;
+        let policy = runtime.egress_policy();
+        assert_eq!(
+            policy.dialer_link.as_deref(),
+            Some("socks5://127.0.0.1:10808")
+        );
+        let transport_policy = policy.transport_policy()?;
+        assert_eq!(
+            transport_policy.dialer_link,
+            Some(zuicity_transport::ProxyDialerLink::parse(
+                "socks5://127.0.0.1:10808"
+            )?)
+        );
         Ok(())
     }
 

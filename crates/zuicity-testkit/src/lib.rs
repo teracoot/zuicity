@@ -409,11 +409,14 @@ fn loopback_addr_for_family(target: SocketAddr) -> SocketAddr {
     }
 }
 
+/// One SOCKS5 `CONNECT` request observed by the test proxy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Socks5ConnectRequest {
+    /// Requested target endpoint.
     pub target: SocketAddr,
 }
 
+/// Starts a one-connection, no-authentication SOCKS5 `CONNECT` test proxy.
 pub async fn start_socks5_tcp_connect_proxy() -> std::io::Result<(
     SocketAddr,
     tokio::sync::mpsc::Receiver<Socks5ConnectRequest>,
@@ -423,70 +426,130 @@ pub async fn start_socks5_tcp_connect_proxy() -> std::io::Result<(
     let local_addr = listener.local_addr()?;
     let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
     let task = tokio::spawn(async move {
-        let (mut inbound, _) = listener.accept().await?;
-        let mut greeting = [0_u8; 2];
-        inbound.read_exact(&mut greeting).await?;
-        if greeting[0] != 0x05 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid SOCKS version",
-            ));
-        }
-        let mut methods = vec![0_u8; greeting[1] as usize];
-        inbound.read_exact(&mut methods).await?;
-        if !methods.contains(&0x00) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SOCKS5 client did not offer no-auth",
-            ));
-        }
-        inbound.write_all(&[0x05, 0x00]).await?;
-
-        let mut request = [0_u8; 4];
-        inbound.read_exact(&mut request).await?;
-        if request[..3] != [0x05, 0x01, 0x00] {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid SOCKS5 CONNECT request",
-            ));
-        }
-        let target = match request[3] {
-            0x01 => {
-                let mut raw = [0_u8; 6];
-                inbound.read_exact(&mut raw).await?;
-                SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
-                    u16::from_be_bytes([raw[4], raw[5]]),
-                )
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "test proxy only supports IPv4 CONNECT targets",
-                ));
-            }
-        };
-        request_tx
-            .send(Socks5ConnectRequest { target })
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "request channel closed")
-            })?;
-        let mut outbound = tokio::net::TcpStream::connect(target).await?;
-        inbound
-            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await?;
-        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
-        Ok(())
+        let (inbound, _) = listener.accept().await?;
+        handle_socks5_tcp_connect(inbound, request_tx).await
     });
     Ok((local_addr, request_rx, task))
 }
 
+/// Starts a proxy whose first connection reads the greeting but never replies,
+/// then serves one normal SOCKS5 `CONNECT` after that client closes.
+pub async fn start_socks5_tcp_connect_proxy_after_silent_connection() -> std::io::Result<(
+    SocketAddr,
+    tokio::sync::mpsc::Receiver<Socks5ConnectRequest>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let local_addr = listener.local_addr()?;
+    let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let (mut silent, _) = listener.accept().await?;
+        read_socks5_greeting(&mut silent).await?;
+        let mut drain = [0_u8; 256];
+        while silent.read(&mut drain).await? != 0 {}
+
+        let (inbound, _) = listener.accept().await?;
+        handle_socks5_tcp_connect(inbound, request_tx).await
+    });
+    Ok((local_addr, request_rx, task))
+}
+
+async fn read_socks5_greeting(inbound: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut greeting = [0_u8; 2];
+    inbound.read_exact(&mut greeting).await?;
+    if greeting[0] != 0x05 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid SOCKS version",
+        ));
+    }
+    let mut methods = vec![0_u8; greeting[1] as usize];
+    inbound.read_exact(&mut methods).await?;
+    Ok(methods)
+}
+
+async fn handle_socks5_tcp_connect(
+    mut inbound: tokio::net::TcpStream,
+    request_tx: tokio::sync::mpsc::Sender<Socks5ConnectRequest>,
+) -> std::io::Result<()> {
+    let methods = read_socks5_greeting(&mut inbound).await?;
+    if !methods.contains(&0x00) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SOCKS5 client did not offer no-auth",
+        ));
+    }
+    inbound.write_all(&[0x05, 0x00]).await?;
+
+    let mut request = [0_u8; 4];
+    inbound.read_exact(&mut request).await?;
+    if request[..3] != [0x05, 0x01, 0x00] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid SOCKS5 CONNECT request",
+        ));
+    }
+    let target = match request[3] {
+        0x01 => {
+            let mut raw = [0_u8; 6];
+            inbound.read_exact(&mut raw).await?;
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3])),
+                u16::from_be_bytes([raw[4], raw[5]]),
+            )
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "test proxy only supports IPv4 CONNECT targets",
+            ));
+        }
+    };
+    request_tx
+        .send(Socks5ConnectRequest { target })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "request channel closed")
+        })?;
+    let mut outbound = tokio::net::TcpStream::connect(target).await?;
+    inbound
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    Ok(())
+}
+
+/// Multi-connection SOCKS5 CONNECT proxy for concurrency / production soak tests.
+pub async fn start_socks5_tcp_connect_proxy_multi(
+    max_requests: usize,
+) -> std::io::Result<(
+    SocketAddr,
+    tokio::sync::mpsc::Receiver<Socks5ConnectRequest>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+)> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let local_addr = listener.local_addr()?;
+    let (request_tx, request_rx) = tokio::sync::mpsc::channel(max_requests.max(1));
+    let task = tokio::spawn(async move {
+        loop {
+            let (inbound, _) = listener.accept().await?;
+            let request_tx = request_tx.clone();
+            tokio::spawn(async move {
+                let _ = handle_socks5_tcp_connect(inbound, request_tx).await;
+            });
+        }
+    });
+    Ok((local_addr, request_rx, task))
+}
+
+/// One SOCKS5 UDP datagram target observed by the test proxy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Socks5UdpAssociateRequest {
+    /// Requested UDP target endpoint.
     pub target: SocketAddr,
 }
 
+/// Starts a one-association, no-authentication SOCKS5 UDP test proxy.
 pub async fn start_socks5_udp_associate_proxy() -> std::io::Result<(
     SocketAddr,
     tokio::sync::mpsc::Receiver<Socks5UdpAssociateRequest>,
@@ -738,7 +801,10 @@ impl ManagedProcess {
         }
     }
 
-    /// Sends SIGTERM, waits up to `timeout`, then sends SIGKILL if needed.
+    /// Requests termination and waits up to `timeout`, forcing exit if needed.
+    ///
+    /// Unix sends `SIGTERM` first. Windows has no equivalent portable signal for
+    /// console children, so it terminates the child directly.
     pub fn terminate(&mut self, timeout: Duration) -> anyhow::Result<ManagedProcessExit> {
         self.terminate_inner(timeout)
     }
@@ -752,7 +818,10 @@ impl ManagedProcess {
             anyhow::bail!("managed process {} already exited", self.pid);
         };
 
+        #[cfg(unix)]
         send_signal(self.pid, "TERM")?;
+        #[cfg(windows)]
+        child.kill()?;
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -760,7 +829,7 @@ impl ManagedProcess {
                 return Ok(ManagedProcessExit {
                     pid: self.pid,
                     status,
-                    forced: false,
+                    forced: cfg!(windows),
                 });
             }
             if Instant::now() >= deadline {
@@ -782,7 +851,10 @@ impl Drop for ManagedProcess {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
+                #[cfg(unix)]
                 let _ = send_signal(self.pid, "TERM");
+                #[cfg(windows)]
+                let _ = child.kill();
                 let deadline = Instant::now() + Duration::from_secs(1);
                 loop {
                     match child.try_wait() {
@@ -832,6 +904,7 @@ fn default_process_log_path() -> PathBuf {
     Path::new(DEFAULT_ARTIFACT_DIR).join("managed-process.log")
 }
 
+#[cfg(unix)]
 fn send_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
     let status = Command::new("kill")
         .arg(format!("-{signal}"))
@@ -844,6 +917,7 @@ fn send_signal(pid: u32, signal: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn process_exists(pid: u32) -> anyhow::Result<bool> {
     let status = Command::new("kill")
         .arg("-0")
@@ -851,6 +925,15 @@ fn process_exists(pid: u32) -> anyhow::Result<bool> {
         .stderr(Stdio::null())
         .status()?;
     Ok(status.success())
+}
+
+#[cfg(windows)]
+fn process_exists(pid: u32) -> anyhow::Result<bool> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
 }
 
 fn unique_artifact_name(label: &str) -> String {

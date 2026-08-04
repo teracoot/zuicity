@@ -3003,6 +3003,7 @@ dependencies = [
  "clap",
  "rcgen",
  "rustls-pemfile",
+ "serde_json",
  "shadowsocks",
  "thiserror",
  "time",
