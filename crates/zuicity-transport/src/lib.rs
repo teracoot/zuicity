@@ -87,7 +87,6 @@ pub use reports::{
 };
 pub use shadowsocks_dialer::{ShadowsocksDialerLink, ShadowsocksRDialerLink};
 pub use socks5_dialer::Socks5DialerLink;
-use tls_config::build_client_config_with_webpki_roots;
 pub use tls_config::{
     QuicClientConfig, QuicServerConfig, build_client_config_with_cert_chain_pin,
     build_client_config_with_roots, build_client_crypto_config_with_cert_chain_pin,
@@ -95,19 +94,21 @@ pub use tls_config::{
     build_server_config_from_pem_with_policy, build_server_crypto_config_from_pem,
     build_transport_config,
 };
+use tls_config::{
+    build_client_config_with_cert_chain_pin_and_policy, build_client_config_with_roots_and_policy,
+    build_client_config_with_webpki_roots,
+};
 use tls_verify::{NoCertificateVerification, PinnedLeafSha256Verification};
 pub use trojan_dialer::TrojanDialerLink;
 pub use tuic_dialer::TuicDialerLink;
 use udp_endpoint::{build_ecn_safe_endpoint, build_ecn_safe_endpoint_from_socket};
-#[cfg(target_os = "linux")]
-use udp_gso::is_gso_rejection;
 pub use udp_modes::{GroMode, GsoMode};
 use udp_socket_buffers::configure_socket_buffers;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use udp_state::GsoTestHook;
 #[cfg(target_os = "linux")]
-use udp_state::PlainSendCounters;
-use udp_state::{GroCounters, GroReceiver, GsoCounters, GsoDestState};
+use udp_state::{GroCounters, PlainSendCounters};
+use udp_state::{GroReceiver, GsoCounters, GsoDestState};
 pub use vless_dialer::VlessDialerLink;
 pub use vmess_dialer::VmessDialerLink;
 
@@ -139,6 +140,7 @@ const MAX_UNACCEPTED_CONNECTION_BUFFER_TOTAL: u64 =
 struct PlainUdpTestConfig {
     gso_mode: GsoMode,
     gro_mode: GroMode,
+    #[cfg(target_os = "linux")]
     gso_hook: GsoTestHook,
     #[cfg(target_os = "linux")]
     plain_hook: Option<udp_plain_test_support::PlainSendTestHook>,
@@ -150,6 +152,7 @@ impl PlainUdpTestConfig {
         Self {
             gso_mode,
             gro_mode,
+            #[cfg(target_os = "linux")]
             gso_hook: GsoTestHook::None,
             #[cfg(target_os = "linux")]
             plain_hook: None,
@@ -435,28 +438,14 @@ fn dialer_link_query_u64(
         .transpose()
 }
 
-/// An adaptive tokio-only UDP socket for quinn.
+/// A tokio-only UDP socket for Quinn with safe ordinary-datagram defaults.
 ///
-/// The receive path is deliberately plain: no GRO, no ECN, no PMTUDISC. quinn's
-/// default socket configures `UDP_GRO`, `IP_TOS` (ECN), and
-/// `IP_MTU_DISCOVER=PROBE` plus per-packet receive control messages; several
-/// network paths (veth/netns, tun/VPN, virtio, some cloud NICs) reject those
-/// with `EINVAL`, stranding the QUIC handshake and timing out the connection —
-/// invisible on loopback but fatal cross-host.
-///
-/// The send path is adaptive. In [`GsoMode::Auto`] eligible *batched
-/// short-header* transmits attempt one `sendmsg` carrying a per-message
-/// `UDP_SEGMENT` control message (never a persistent socket-level option, which
-/// is the quinn-rs/quinn#2575 trap). Long-header packets (QUIC Initial /
-/// Handshake, first byte `& 0x80 != 0`) are *never* segmented, so the handshake
-/// always crosses GSO-hostile paths. On the first `EINVAL`/`EIO` from a
-/// destination the socket marks that destination disabled and immediately
-/// resends the same contents as plain datagrams in the same call, so no packet
-/// is dropped. In [`GsoMode::Off`] every transmit is sent one datagram per
-/// segment, matching the historical safe behaviour and upstream Go quic-go.
+/// Linux receive batching uses `UDP_GRO` when available. Sends use ordinary
+/// datagrams unless GSO is explicitly enabled; eligible short-header groups may
+/// then use a per-message `UDP_SEGMENT` cmsg with per-destination fallback.
 struct PlainUdpSocket {
     io: Arc<tokio::net::UdpSocket>,
-    /// GSO mode for this socket.
+    /// GSO mode for this socket's send path.
     mode: GsoMode,
     /// Maximum datagrams Quinn may group into one transmit for this endpoint.
     plain_batch_segments: usize,
@@ -476,21 +465,16 @@ struct PlainUdpSocket {
     may_fragment: bool,
     /// Per-destination learned GSO capability.
     gso_state: Mutex<HashMap<SocketAddr, GsoDestState>>,
-    /// Send-path counters, shareable with tests.
-    counters: Arc<GsoCounters>,
-    /// Receive-path GRO counters, shareable with tests.
+    /// Adaptive GSO counters.
+    gso_counters: Arc<GsoCounters>,
+    /// Receive-path GRO counters, shareable with Linux tests.
+    #[cfg(target_os = "linux")]
     gro_counters: Arc<GroCounters>,
     #[cfg(target_os = "linux")]
     plain_batch_io: udp_plain_syscall::PlainBatchIo,
     #[cfg(target_os = "linux")]
     plain_counters: Arc<PlainSendCounters>,
-    /// Shared sender used only to emit the per-message `UDP_SEGMENT` cmsg via
-    /// `sendmsg` on this socket's fd. Built from a throwaway socket so it never
-    /// mutates the receive options of the real socket. Linux-only.
-    #[cfg(target_os = "linux")]
-    gso_sender: Option<Arc<quinn::udp::UdpSocketState>>,
-    /// Test hook forcing GSO failures. Present only in test builds.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     test_hook: GsoTestHook,
 }
 
@@ -511,8 +495,7 @@ impl PlainUdpSocket {
     fn plain_counters(&self) -> Arc<PlainSendCounters> {
         Arc::clone(&self.plain_counters)
     }
-    /// Builds a socket using the production GSO mode resolved from the
-    /// environment ([`GsoMode::from_env`]).
+    /// Builds a socket using the environment-selected GSO mode.
     fn new(
         socket: std::net::UdpSocket,
         default_plain_batch_segments: usize,
@@ -522,8 +505,6 @@ impl PlainUdpSocket {
         let plain_batch_segments =
             udp_modes::plain_batch_segments_from_env(default_plain_batch_segments);
         let (io, gro_recv, may_fragment) = Self::prepare_io(socket, gro_mode)?;
-        #[cfg(target_os = "linux")]
-        let gso_sender = Self::build_sender_for(mode);
         let io = Arc::new(io);
         #[cfg(target_os = "linux")]
         let plain_counters = Arc::new(PlainSendCounters::default());
@@ -537,49 +518,16 @@ impl PlainUdpSocket {
             gro_recv,
             may_fragment,
             gso_state: Mutex::new(HashMap::new()),
-            counters: Arc::new(GsoCounters::default()),
+            gso_counters: Arc::new(GsoCounters::default()),
+            #[cfg(target_os = "linux")]
             gro_counters: Arc::new(GroCounters::default()),
             #[cfg(target_os = "linux")]
             plain_batch_io,
             #[cfg(target_os = "linux")]
             plain_counters,
-            #[cfg(target_os = "linux")]
-            gso_sender,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             test_hook: GsoTestHook::None,
         })
-    }
-
-    /// Builds a socket with an explicit GSO mode and failure hook (used by tests).
-    /// The GRO mode is resolved from the environment, matching production.
-    #[cfg(test)]
-    fn with_mode_and_hook(
-        socket: std::net::UdpSocket,
-        mode: GsoMode,
-        test_hook: GsoTestHook,
-    ) -> std::io::Result<Self> {
-        Self::with_modes_and_hook(socket, mode, GroMode::from_env(), test_hook)
-    }
-
-    /// Builds a socket with explicit GSO and GRO modes and a failure hook (used
-    /// by GRO tests that pin the receive-path mode independently of the env).
-    #[cfg(test)]
-    fn with_modes_and_hook(
-        socket: std::net::UdpSocket,
-        mode: GsoMode,
-        gro_mode: GroMode,
-        test_hook: GsoTestHook,
-    ) -> std::io::Result<Self> {
-        Self::with_test_config(
-            socket,
-            PlainUdpTestConfig {
-                gso_mode: mode,
-                gro_mode,
-                gso_hook: test_hook,
-                #[cfg(target_os = "linux")]
-                plain_hook: None,
-            },
-        )
     }
 
     #[cfg(test)]
@@ -588,9 +536,14 @@ impl PlainUdpSocket {
         config: PlainUdpTestConfig,
     ) -> std::io::Result<Self> {
         let (io, gro_recv, may_fragment) = Self::prepare_io(socket, config.gro_mode)?;
-        #[cfg(target_os = "linux")]
-        let gso_sender = Self::build_sender_for(config.gso_mode);
         let io = Arc::new(io);
+        #[cfg(target_os = "linux")]
+        let plain_batch_segments = udp_modes::plain_batch_segments_from_value(
+            None,
+            udp_plain_batch::TEST_PLAIN_BATCH_DATAGRAMS,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let plain_batch_segments = 1;
         #[cfg(target_os = "linux")]
         let plain_counters = Arc::new(PlainSendCounters::default());
         #[cfg(target_os = "linux")]
@@ -601,22 +554,19 @@ impl PlainUdpSocket {
         Ok(Self {
             io,
             mode: config.gso_mode,
-            plain_batch_segments: udp_modes::plain_batch_segments_from_value(
-                None,
-                udp_plain_batch::TEST_PLAIN_BATCH_DATAGRAMS,
-            ),
+            plain_batch_segments,
             gro_mode: config.gro_mode,
             gro_recv,
             may_fragment,
             gso_state: Mutex::new(HashMap::new()),
-            counters: Arc::new(GsoCounters::default()),
+            gso_counters: Arc::new(GsoCounters::default()),
+            #[cfg(target_os = "linux")]
             gro_counters: Arc::new(GroCounters::default()),
             #[cfg(target_os = "linux")]
             plain_batch_io,
             #[cfg(target_os = "linux")]
             plain_counters,
             #[cfg(target_os = "linux")]
-            gso_sender,
             test_hook: config.gso_hook,
         })
     }
@@ -632,20 +582,18 @@ impl PlainUdpSocket {
         Ok((io, gro_recv, may_fragment))
     }
 
-    /// Returns a shared handle to the send-path counters (used by tests).
-    #[cfg(test)]
-    fn counters(&self) -> Arc<GsoCounters> {
-        Arc::clone(&self.counters)
-    }
-
     /// Returns a shared handle to the receive-path GRO counters (used by tests).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn gro_counters(&self) -> Arc<GroCounters> {
         Arc::clone(&self.gro_counters)
     }
 
-    /// Returns the learned GSO state for a destination (used by tests).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
+    fn counters(&self) -> Arc<GsoCounters> {
+        Arc::clone(&self.gso_counters)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     fn gso_dest_state(&self, dest: SocketAddr) -> GsoDestState {
         self.gso_state
             .lock()
@@ -673,76 +621,52 @@ impl quinn::AsyncUdpSocket for PlainUdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
-        let dest = transmit.destination;
+        let destination = transmit.destination;
         let segment = transmit
             .segment_size
             .unwrap_or(transmit.contents.len())
             .max(1);
-        let batched = segment < transmit.contents.len();
+        let segment_count = transmit.contents.chunks(segment).len();
         let long_header = Self::has_long_header(transmit, segment);
-
-        // Send plainly when: GSO is off / unsupported, the transmit is not
-        // batched, this destination already fell back, or ANY chunk is a QUIC
-        // long-header (Initial/Handshake) packet that must never be segmented.
-        let gso_eligible = matches!(self.mode, GsoMode::Auto)
-            && batched
-            && self.dest_state(dest) != GsoDestState::Disabled
+        let gso_eligible = cfg!(target_os = "linux")
+            && matches!(self.mode, GsoMode::Auto)
+            && segment_count >= 2
+            && segment_count <= 44
+            && self.dest_state(destination) != GsoDestState::Disabled
             && !long_header;
-        if !gso_eligible {
-            return self.send_plain_chunks(transmit);
-        }
-
-        // Eligible batched short-header transmit: attempt one GSO sendmsg.
-        // Tripwire: by the guard above `long_header` is false here; if a future
-        // change ever lets a long-header packet reach this point, the counter
-        // makes the regression observable (tests assert it stays zero).
-        if long_header {
-            self.counters
-                .long_header_gso_attempt
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.counters.attempt.fetch_add(1, Ordering::Relaxed);
-        match self.try_send_gso(transmit) {
-            Ok(()) => {
-                self.counters.success.fetch_add(1, Ordering::Relaxed);
-                if self.dest_state(dest) != GsoDestState::Working {
-                    self.set_dest_state(dest, GsoDestState::Working);
-                    tracing::info!(%dest, "udp gso engaged");
+        let result = if !gso_eligible {
+            self.send_plain_chunks(transmit)
+        } else {
+            self.gso_counters.attempt.fetch_add(1, Ordering::Relaxed);
+            match self.try_send_gso(transmit) {
+                Ok(()) => {
+                    self.gso_counters.success.fetch_add(1, Ordering::Relaxed);
+                    self.set_dest_state(destination, GsoDestState::Working);
+                    Ok(())
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(error),
+                Err(error) if udp_gso::is_gso_rejection(&error) => {
+                    self.gso_counters.fallback.fetch_add(1, Ordering::Relaxed);
+                    self.set_dest_state(destination, GsoDestState::Disabled);
+                    self.gso_counters
+                        .plain_after_fallback
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.send_plain_chunks(transmit)
+                }
+                Err(error) => Err(error),
+            }
+        };
+
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(error),
+            Err(error) => {
+                // UDP send failures represent packet loss, not a fatal QUIC I/O
+                // failure. Quinn retransmits the affected data; only WouldBlock
+                // must be returned so it can register for socket writability.
+                tracing::debug!(%error, %destination, "udp send failed; leaving recovery to quic");
                 Ok(())
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(error),
-            #[cfg(target_os = "linux")]
-            Err(error) if is_gso_rejection(&error) => {
-                self.counters.fallback.fetch_add(1, Ordering::Relaxed);
-                if self.dest_state(dest) != GsoDestState::Disabled {
-                    self.set_dest_state(dest, GsoDestState::Disabled);
-                    tracing::warn!(
-                        %dest,
-                        error = %error,
-                        "udp gso rejected by egress path; disabling gso for destination and falling back to plain datagrams"
-                    );
-                }
-                self.counters
-                    .plain_after_fallback
-                    .fetch_add(1, Ordering::Relaxed);
-                self.send_plain_chunks(transmit)
-            }
-            Err(error) => {
-                // Unexpected non-WouldBlock, non-rejection error. Fall back to
-                // plain datagrams rather than dropping the transmit.
-                self.counters.fallback.fetch_add(1, Ordering::Relaxed);
-                self.set_dest_state(dest, GsoDestState::Disabled);
-                tracing::warn!(
-                    %dest,
-                    error = %error,
-                    "udp gso sendmsg failed; falling back to plain datagrams"
-                );
-                self.counters
-                    .plain_after_fallback
-                    .fetch_add(1, Ordering::Relaxed);
-                self.send_plain_chunks(transmit)
-            }
+            Ok(()) => Ok(()),
         }
     }
 
@@ -1011,13 +935,25 @@ impl JuicityIncomingConnection {
 #[derive(Debug, Clone)]
 pub struct JuicityQuicClient {
     endpoint: quinn::Endpoint,
+    policy: QuicRuntimePolicy,
 }
 
 impl JuicityQuicClient {
     /// Binds a client endpoint to a local UDP socket address.
     pub fn bind(addr: SocketAddr) -> Result<Self, TransportError> {
+        Self::bind_with_policy(addr, &QuicRuntimePolicy::upstream_client())
+    }
+
+    /// Binds a client endpoint with an explicit QUIC runtime policy.
+    pub fn bind_with_policy(
+        addr: SocketAddr,
+        policy: &QuicRuntimePolicy,
+    ) -> Result<Self, TransportError> {
         let endpoint = build_ecn_safe_endpoint(addr, None)?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            policy: policy.clone(),
+        })
     }
 
     /// Returns the local UDP socket address.
@@ -1035,7 +971,8 @@ impl JuicityQuicClient {
         uuid: uuid::Uuid,
         password: &[u8],
     ) -> Result<AuthenticatedConnection, TransportError> {
-        let config = build_client_config_with_roots(roots_pem, allow_insecure)?;
+        let config =
+            build_client_config_with_roots_and_policy(roots_pem, allow_insecure, &self.policy)?;
         let connection = self
             .endpoint
             .connect_with(config.inner, server_addr, server_name)?
@@ -1056,7 +993,10 @@ impl JuicityQuicClient {
         uuid: uuid::Uuid,
         password: &[u8],
     ) -> Result<AuthenticatedConnection, TransportError> {
-        let config = build_client_config_with_cert_chain_pin(pinned_cert_chain_sha256)?;
+        let config = build_client_config_with_cert_chain_pin_and_policy(
+            pinned_cert_chain_sha256,
+            &self.policy,
+        )?;
         let connection = self
             .endpoint
             .connect_with(config.inner, server_addr, server_name)?
@@ -2925,6 +2865,8 @@ fn build_tuic_client_config(link: &TuicDialerLink) -> Result<quinn::ClientConfig
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
     let mut policy = QuicRuntimePolicy::upstream_client();
+    policy.congestion_controller =
+        CongestionController::from_config_name(link.congestion_control.as_deref());
     policy.keep_alive = TUIC_CLIENT_KEEP_ALIVE;
     policy.enable_datagrams = true;
     config.transport_config(build_transport_config(&policy).into_arc());
@@ -3455,7 +3397,7 @@ async fn connect_tcp_proxy_target_via_juicity(
         if egress_source_mismatches_target(&proxy_egress, proxy_target) {
             continue;
         }
-        let client = match bind_juicity_dialer_client(proxy_target, &proxy_egress) {
+        let client = match bind_juicity_dialer_client(proxy_target, &proxy_egress, link) {
             Ok(client) => client,
             Err(error) => {
                 last_error = Some(error);
@@ -3494,6 +3436,7 @@ async fn connect_tcp_proxy_target_via_juicity(
 fn bind_juicity_dialer_client(
     proxy_target: SocketAddr,
     egress: &ProxyEgressPolicy,
+    link: &JuicityDialerLink,
 ) -> Result<JuicityQuicClient, TransportError> {
     let bind_addr = egress.send_through.map_or_else(
         || {
@@ -3508,7 +3451,10 @@ fn bind_juicity_dialer_client(
     let socket = std::net::UdpSocket::bind(bind_addr)?;
     apply_socket_fwmark(&socket, egress)?;
     let endpoint = build_ecn_safe_endpoint_from_socket(socket, None)?;
-    Ok(JuicityQuicClient { endpoint })
+    let mut policy = QuicRuntimePolicy::upstream_client();
+    policy.congestion_controller =
+        CongestionController::from_config_name(Some(&link.congestion_control));
+    Ok(JuicityQuicClient { endpoint, policy })
 }
 
 async fn connect_juicity_dialer_link(
@@ -3527,7 +3473,7 @@ async fn connect_juicity_dialer_link(
             )
             .await;
     }
-    let config = build_client_config_with_webpki_roots(link.allow_insecure)?;
+    let config = build_client_config_with_webpki_roots(link.allow_insecure, &client.policy)?;
     let connection = client
         .endpoint
         .connect_with(config.inner, proxy_target, &link.sni)?
@@ -3942,9 +3888,7 @@ where
             message: format!("unexpected response {method_response:?}"),
         });
     }
-    if method_response[1] == 0x02 {
-        socks5_username_password_auth(stream, link).await?;
-    } else if method_response[1] != method {
+    if method_response[1] != method {
         return Err(TransportError::Socks5Proxy {
             stage: "method selection",
             message: format!(
@@ -3952,6 +3896,9 @@ where
                 method_response[1]
             ),
         });
+    }
+    if method_response[1] == 0x02 {
+        socks5_username_password_auth(stream, link).await?;
     }
     Ok(())
 }
@@ -3973,7 +3920,7 @@ where
 
     let mut response = [0_u8; 4];
     stream.read_exact(&mut response).await?;
-    if response[0] != 0x05 || response[1] != 0x00 {
+    if response[0] != 0x05 || response[1] != 0x00 || response[2] != 0x00 {
         return Err(TransportError::Socks5Proxy {
             stage: "connect",
             message: format!("unexpected response {response:?}"),
@@ -4008,6 +3955,12 @@ where
 {
     let username = link.username.as_deref().unwrap_or_default().as_bytes();
     let password = link.password.as_deref().unwrap_or_default().as_bytes();
+    if username.is_empty() || password.is_empty() {
+        return Err(TransportError::Socks5Proxy {
+            stage: "username/password auth",
+            message: "username and password must each contain at least one byte".to_owned(),
+        });
+    }
     if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
         return Err(TransportError::Socks5Proxy {
             stage: "username/password auth",
@@ -4350,6 +4303,7 @@ struct Socks5UdpPacketSocket {
     socket: tokio::net::UdpSocket,
     relay_addr: SocketAddr,
     target_header: OwnedProxyHeader,
+    domain_response_addr: Option<SocketAddr>,
 }
 
 impl shadowsocks::relay::udprelay::DatagramSocket for Socks5UdpPacketSocket {
@@ -4432,16 +4386,41 @@ impl Socks5UdpPacketSocket {
     ) -> Poll<std::io::Result<SocketAddr>> {
         let mut packet = vec![0_u8; 65_535];
         let mut packet_buf = ReadBuf::new(packet.as_mut_slice());
-        let relay_peer = match self.socket.poll_recv_from(cx, &mut packet_buf) {
-            Poll::Ready(Ok(peer)) => peer,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending => return Poll::Pending,
+        let relay_peer = loop {
+            match self.socket.poll_recv_from(cx, &mut packet_buf) {
+                Poll::Ready(Ok(peer)) if peer == self.relay_addr => break peer,
+                Poll::Ready(Ok(_)) => packet_buf.clear(),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
         };
         let received = packet_buf.filled().len();
         let (peer, payload_offset) = decode_socks5_udp_response_header(&packet[..received])
             .map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
+        let peer = match peer {
+            Socks5UdpResponseAddress::Ip(peer) => peer,
+            Socks5UdpResponseAddress::Domain { domain, port } => {
+                let matches_target = matches!(
+                    &self.target_header.address,
+                    OwnedProxyAddress::Domain(target)
+                        if target == &domain && self.target_header.port == port
+                );
+                if !matches_target {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "SOCKS5 UDP response domain did not match the requested target",
+                    )));
+                }
+                self.domain_response_addr.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "SOCKS5 UDP response domain had no resolved target",
+                    )
+                })?
+            }
+        };
         let payload = &packet[payload_offset..received];
         if output.remaining() < payload.len() {
             return Poll::Ready(Err(std::io::Error::new(
@@ -4735,14 +4714,22 @@ async fn relay_udp_payload_to_target_with_socks5_association(
     socket.send_to(&datagram, relay_addr).await?;
 
     let mut response = vec![0_u8; 65_535];
-    let received =
-        tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut response)).await;
-    let Ok(received) = received else {
-        return Err(TransportError::NoUsableUdpTarget);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let received = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::NoUsableUdpTarget);
+        }
+        let received = tokio::time::timeout(remaining, socket.recv_from(&mut response))
+            .await
+            .map_err(|_| TransportError::NoUsableUdpTarget)??;
+        if received.1 == relay_addr {
+            break received.0;
+        }
     };
-    let (received, _relay_peer) = received?;
     response.truncate(received);
     let (peer, payload_offset) = decode_socks5_udp_response_header(&response)?;
+    let peer = resolve_socks5_udp_response_address(peer, relay_addr.is_ipv4()).await?;
     let target = match udp_ip_header_target(header) {
         Ok(target) => target,
         Err(TransportError::UnsupportedDomainTarget) => peer,
@@ -6238,7 +6225,7 @@ async fn connect_juicity_udp_association(
         if egress_source_mismatches_target(&proxy_egress, proxy_target) {
             continue;
         }
-        let client = match bind_juicity_dialer_client(proxy_target, &proxy_egress) {
+        let client = match bind_juicity_dialer_client(proxy_target, &proxy_egress, link) {
             Ok(client) => client,
             Err(error) => {
                 last_error = Some(error);
@@ -6367,11 +6354,18 @@ async fn connect_shadowsocks_udp_association_via_socks5(
     };
     let target_header =
         proxy_endpoint_header(Network::Udp, shadowsocks.host.as_str(), shadowsocks.port);
+    let domain_response_addr = match &target_header.address {
+        OwnedProxyAddress::Domain(domain) => Some(
+            resolve_socks5_domain_address(domain, target_header.port, relay_addr.is_ipv4()).await?,
+        ),
+        _ => None,
+    };
     let socket = Socks5UdpPacketSocket {
         _control: Arc::new(tokio::sync::Mutex::new(_control)),
         socket,
         relay_addr,
         target_header,
+        domain_response_addr,
     };
     Ok(ShadowsocksUdpAssociation {
         socket: ShadowsocksUdpRelaySocket::Socks5(shadowsocks::ProxySocket::from_socket(
@@ -6436,7 +6430,8 @@ where
     }
     request.extend_from_slice(&0_u16.to_be_bytes());
     stream.write_all(&request).await?;
-    let mut relay_addr = read_socks5_reply_addr(stream, "udp associate").await?;
+    let mut relay_addr =
+        read_socks5_reply_addr(stream, "udp associate", proxy_target.is_ipv4()).await?;
     if relay_addr.ip().is_unspecified() {
         relay_addr = SocketAddr::new(proxy_target.ip(), relay_addr.port());
     }
@@ -6446,13 +6441,14 @@ where
 async fn read_socks5_reply_addr<S>(
     stream: &mut S,
     stage: &'static str,
+    ipv4: bool,
 ) -> Result<SocketAddr, TransportError>
 where
     S: AsyncRead + Unpin,
 {
     let mut response = [0_u8; 4];
     stream.read_exact(&mut response).await?;
-    if response[0] != 0x05 || response[1] != 0x00 {
+    if response[0] != 0x05 || response[1] != 0x00 || response[2] != 0x00 {
         return Err(TransportError::Socks5Proxy {
             stage,
             message: format!("unexpected response {response:?}"),
@@ -6474,10 +6470,7 @@ where
             stream.read_exact(&mut raw).await?;
             let domain = std::str::from_utf8(&raw[..usize::from(len[0])])?;
             let port = u16::from_be_bytes([raw[usize::from(len[0])], raw[usize::from(len[0]) + 1]]);
-            tokio::net::lookup_host((domain, port))
-                .await?
-                .next()
-                .ok_or(TransportError::NoUsableUdpTarget)
+            resolve_socks5_domain_address(domain, port, ipv4).await
         }
         0x04 => {
             let mut raw = [0_u8; 18];
@@ -6510,9 +6503,38 @@ fn encode_socks5_udp_datagram(
     Ok(datagram)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Socks5UdpResponseAddress {
+    Ip(SocketAddr),
+    Domain { domain: String, port: u16 },
+}
+
+async fn resolve_socks5_domain_address(
+    domain: &str,
+    port: u16,
+    ipv4: bool,
+) -> Result<SocketAddr, TransportError> {
+    tokio::net::lookup_host((domain, port))
+        .await?
+        .find(|address| address.is_ipv4() == ipv4)
+        .ok_or(TransportError::NoUsableUdpTarget)
+}
+
+async fn resolve_socks5_udp_response_address(
+    address: Socks5UdpResponseAddress,
+    ipv4: bool,
+) -> Result<SocketAddr, TransportError> {
+    match address {
+        Socks5UdpResponseAddress::Ip(address) => Ok(address),
+        Socks5UdpResponseAddress::Domain { domain, port } => {
+            resolve_socks5_domain_address(&domain, port, ipv4).await
+        }
+    }
+}
+
 fn decode_socks5_udp_response_header(
     datagram: &[u8],
-) -> Result<(SocketAddr, usize), TransportError> {
+) -> Result<(Socks5UdpResponseAddress, usize), TransportError> {
     if datagram.len() < 4 || datagram[0] != 0 || datagram[1] != 0 || datagram[2] != 0 {
         return Err(TransportError::Socks5Proxy {
             stage: "udp relay",
@@ -6528,7 +6550,7 @@ fn decode_socks5_udp_response_header(
                 });
             }
             Ok((
-                SocketAddr::new(
+                Socks5UdpResponseAddress::Ip(SocketAddr::new(
                     IpAddr::V4(std::net::Ipv4Addr::new(
                         datagram[4],
                         datagram[5],
@@ -6536,7 +6558,7 @@ fn decode_socks5_udp_response_header(
                         datagram[7],
                     )),
                     u16::from_be_bytes([datagram[8], datagram[9]]),
-                ),
+                )),
                 10,
             ))
         }
@@ -6550,17 +6572,31 @@ fn decode_socks5_udp_response_header(
             let mut addr = [0_u8; 16];
             addr.copy_from_slice(&datagram[4..20]);
             Ok((
-                SocketAddr::new(
+                Socks5UdpResponseAddress::Ip(SocketAddr::new(
                     IpAddr::V6(std::net::Ipv6Addr::from(addr)),
                     u16::from_be_bytes([datagram[20], datagram[21]]),
-                ),
+                )),
                 22,
             ))
         }
-        0x03 => Err(TransportError::Socks5Proxy {
-            stage: "udp relay",
-            message: "domain response address is unsupported".to_owned(),
-        }),
+        0x03 => {
+            if datagram.len() < 5 {
+                return Err(TransportError::Socks5Proxy {
+                    stage: "udp relay",
+                    message: "truncated domain UDP datagram header".to_owned(),
+                });
+            }
+            let len = usize::from(datagram[4]);
+            if len == 0 || datagram.len() < 5 + len + 2 {
+                return Err(TransportError::Socks5Proxy {
+                    stage: "udp relay",
+                    message: "truncated domain UDP datagram header".to_owned(),
+                });
+            }
+            let domain = std::str::from_utf8(&datagram[5..5 + len])?.to_owned();
+            let port = u16::from_be_bytes([datagram[5 + len], datagram[6 + len]]);
+            Ok((Socks5UdpResponseAddress::Domain { domain, port }, 7 + len))
+        }
         other => Err(TransportError::Socks5Proxy {
             stage: "udp relay",
             message: format!("unsupported address type {other:#x}"),
@@ -7312,6 +7348,15 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    async fn tcp_stream_pair() -> std::io::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let client = tokio::net::TcpStream::connect(addr);
+        let server = listener.accept();
+        let (client, (server, _)) = tokio::try_join!(client, server)?;
+        Ok((client, server))
+    }
+
     #[test]
     fn server_pre_authentication_policy_is_bounded_and_restorable() {
         let authenticated = QuicRuntimePolicy::upstream_server();
@@ -7387,12 +7432,54 @@ mod tests {
         assert_eq!(tls_config::bbr_initial_window_bytes(), 32 * 1280);
     }
 
+    fn assert_congestion_controller(
+        controller: Box<dyn quinn::congestion::Controller>,
+        expected: CongestionController,
+    ) {
+        let controller = controller.into_any();
+        let matches = match expected {
+            CongestionController::Bbr => controller.is::<quinn::congestion::Bbr>(),
+            CongestionController::Cubic => controller.is::<quinn::congestion::Cubic>(),
+            CongestionController::NewReno => controller.is::<quinn::congestion::NewReno>(),
+        };
+        assert!(matches, "expected {expected:?} congestion controller");
+    }
+
     #[test]
-    fn gso_mode_is_safe_by_default_and_opt_in_on_linux() {
+    fn congestion_controller_factory_builds_the_selected_algorithm() {
+        for (expected, initial_window) in [
+            (CongestionController::Bbr, 32 * 1280),
+            (CongestionController::Cubic, 10 * 1200),
+            (CongestionController::NewReno, 10 * 1200),
+        ] {
+            let mut policy = QuicRuntimePolicy::upstream_client();
+            policy.congestion_controller = expected;
+            let controller = tls_config::congestion_controller_factory(&policy)
+                .build(std::time::Instant::now(), 1200);
+
+            assert_eq!(controller.initial_window(), initial_window);
+            assert_congestion_controller(controller, expected);
+        }
+    }
+
+    #[test]
+    fn gso_mode_is_safe_by_default_and_explicitly_opt_in() {
         assert_eq!(GsoMode::from_env_values(None, None), GsoMode::Off);
         assert_eq!(GsoMode::from_env_values(Some("false"), None), GsoMode::Off);
         assert_eq!(
+            GsoMode::from_env_values(Some("invalid"), None),
+            GsoMode::Off
+        );
+        assert_eq!(
             GsoMode::from_env_values(Some("1"), None),
+            if cfg!(target_os = "linux") {
+                GsoMode::Auto
+            } else {
+                GsoMode::Off
+            }
+        );
+        assert_eq!(
+            GsoMode::from_env_values(Some("true"), None),
             if cfg!(target_os = "linux") {
                 GsoMode::Auto
             } else {
@@ -7403,10 +7490,14 @@ mod tests {
             GsoMode::from_env_values(Some("true"), Some("1")),
             GsoMode::Off
         );
+        assert_eq!(
+            GsoMode::from_env_values(Some("1"), Some("true")),
+            GsoMode::Off
+        );
     }
 
     #[test]
-    fn gso_transmit_ceiling_preserves_plain_batching_and_clamps_opt_in() {
+    fn gso_transmit_ceiling_preserves_off_batching_and_clamps_opt_in() {
         let transport = build_transport_config(&QuicRuntimePolicy::upstream_client());
 
         if cfg!(target_os = "linux") {
@@ -7424,8 +7515,8 @@ mod tests {
     #[test]
     fn plain_batch_selector_uses_role_defaults_and_only_accepts_sweep_values() {
         if cfg!(target_os = "linux") {
-            let client_default = udp_plain_batch::CLIENT_PLAIN_BATCH_DATAGRAMS;
-            let server_default = udp_plain_batch::SERVER_PLAIN_BATCH_DATAGRAMS;
+            let client_default = 88;
+            let server_default = 96;
             assert_eq!(
                 udp_modes::plain_batch_segments_from_value(None, client_default),
                 88
@@ -7574,6 +7665,62 @@ mod tests {
 
         let authenticated_remote = server_task.await??;
         assert_eq!(authenticated_remote, client.local_addr()?);
+        Ok(())
+    }
+
+    async fn assert_live_congestion_controller_pair(
+        client_controller: CongestionController,
+        server_controller: CongestionController,
+    ) -> Result<(), TransportError> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate fixture cert");
+        let uuid = uuid::Uuid::new_v4();
+        let password = b"congestion controller fixture";
+        let mut server_policy = QuicRuntimePolicy::upstream_server();
+        server_policy.congestion_controller = server_controller;
+        let server = JuicityQuicServer::bind_with_pem_and_policy(
+            ([127, 0, 0, 1], 0).into(),
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+            &server_policy,
+        )?;
+        let server_addr = server.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept_authenticated(uuid, password).await?;
+            Ok::<_, TransportError>(connection.as_quinn().congestion_state())
+        });
+
+        let mut client_policy = QuicRuntimePolicy::upstream_client();
+        client_policy.congestion_controller = client_controller;
+        let client =
+            JuicityQuicClient::bind_with_policy(([127, 0, 0, 1], 0).into(), &client_policy)?;
+        let connection = client
+            .connect_with_roots(
+                server_addr,
+                "localhost",
+                cert.cert.pem().as_bytes(),
+                false,
+                uuid,
+                password,
+            )
+            .await?;
+
+        assert_congestion_controller(connection.as_quinn().congestion_state(), client_controller);
+        assert_congestion_controller(server_task.await??, server_controller);
+        connection.as_quinn().close(0_u32.into(), b"test complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_connections_install_independent_client_and_server_controllers()
+    -> Result<(), TransportError> {
+        for (client, server) in [
+            (CongestionController::Bbr, CongestionController::Cubic),
+            (CongestionController::Cubic, CongestionController::NewReno),
+            (CongestionController::NewReno, CongestionController::Bbr),
+        ] {
+            assert_live_congestion_controller_pair(client, server).await?;
+        }
         Ok(())
     }
 
@@ -10050,6 +10197,22 @@ mod tests {
     }
 
     #[test]
+    fn socks_dialer_link_rejects_partial_or_empty_rfc1929_credentials() {
+        for raw in [
+            "socks5://user@127.0.0.1:1080",
+            "socks5://:password@127.0.0.1:1080",
+            "socks5://user:@127.0.0.1:1080",
+        ] {
+            let error = ProxyDialerLink::parse(raw)
+                .expect_err("partial SOCKS5 credentials must be rejected");
+            assert!(matches!(
+                error,
+                TransportError::InvalidProxyDialerLink { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn socks_dialer_link_normalizes_ipv6_host_for_dns_resolution() -> Result<(), TransportError> {
         let parsed = ProxyDialerLink::parse("socks5://[::1]:1080")?;
         let ProxyDialerLink::Socks5(parsed) = parsed else {
@@ -10058,6 +10221,554 @@ mod tests {
         assert_eq!(parsed.host, "::1");
         assert_eq!(parsed.port, 1080);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_uses_rfc1929_auth_and_encodes_domain_target()
+    -> Result<(), TransportError> {
+        let link = Socks5DialerLink {
+            host: "127.0.0.1".to_owned(),
+            port: 1080,
+            username: Some("vpn user".to_owned()),
+            password: Some("p@ss:word".to_owned()),
+        };
+        let header = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Domain("target.example".to_owned()),
+            port: 8443,
+        };
+        let (mut client, mut proxy) = tcp_stream_pair().await?;
+        let proxy_task = tokio::spawn(async move {
+            let mut greeting = [0_u8; 3];
+            proxy.read_exact(&mut greeting).await?;
+            assert_eq!(greeting, [0x05, 0x01, 0x02]);
+            proxy.write_all(&[0x05, 0x02]).await?;
+
+            let mut auth_header = [0_u8; 2];
+            proxy.read_exact(&mut auth_header).await?;
+            assert_eq!(auth_header, [0x01, 8]);
+            let mut username = [0_u8; 8];
+            proxy.read_exact(&mut username).await?;
+            assert_eq!(&username, b"vpn user");
+            let mut password_len = [0_u8; 1];
+            proxy.read_exact(&mut password_len).await?;
+            assert_eq!(password_len, [9]);
+            let mut password = [0_u8; 9];
+            proxy.read_exact(&mut password).await?;
+            assert_eq!(&password, b"p@ss:word");
+            proxy.write_all(&[0x01, 0x00]).await?;
+
+            let mut request = [0_u8; 4];
+            proxy.read_exact(&mut request).await?;
+            assert_eq!(request, [0x05, 0x01, 0x00, 0x03]);
+            let mut domain_len = [0_u8; 1];
+            proxy.read_exact(&mut domain_len).await?;
+            assert_eq!(domain_len, [14]);
+            let mut domain = [0_u8; 14];
+            proxy.read_exact(&mut domain).await?;
+            assert_eq!(&domain, b"target.example");
+            let mut port = [0_u8; 2];
+            proxy.read_exact(&mut port).await?;
+            assert_eq!(u16::from_be_bytes(port), 8443);
+            proxy
+                .write_all(&[
+                    0x05, 0x00, 0x00, 0x03, 4, b'b', b'i', b'n', b'd', 0x1f, 0x90,
+                ])
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        socks5_connect(&mut client, &header, &link).await?;
+        proxy_task.await.expect("SOCKS5 proxy task joins")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_auth_rejects_unoffered_method_and_bad_credentials() {
+        let no_auth = Socks5DialerLink {
+            host: "127.0.0.1".to_owned(),
+            port: 1080,
+            username: None,
+            password: None,
+        };
+        let (mut client, mut proxy) = tcp_stream_pair()
+            .await
+            .expect("create method-mismatch SOCKS5 stream pair");
+        let proxy_task = tokio::spawn(async move {
+            let mut greeting = [0_u8; 3];
+            proxy
+                .read_exact(&mut greeting)
+                .await
+                .expect("read no-auth SOCKS5 greeting");
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            proxy
+                .write_all(&[0x05, 0x02])
+                .await
+                .expect("write unsupported SOCKS5 method");
+            proxy.flush().await.expect("flush SOCKS5 method response");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            socks5_negotiate_auth(&mut client, &no_auth),
+        )
+        .await
+        .expect("method mismatch response timeout")
+        .expect_err("proxy cannot select an unoffered auth method");
+        assert!(
+            matches!(
+                error,
+                TransportError::Socks5Proxy {
+                    stage: "method selection",
+                    ..
+                }
+            ),
+            "unexpected method-selection error: {error:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("method mismatch proxy task timeout")
+            .expect("method mismatch proxy task joins");
+
+        let authenticated = Socks5DialerLink {
+            host: "127.0.0.1".to_owned(),
+            port: 1080,
+            username: Some("user".to_owned()),
+            password: Some("wrong".to_owned()),
+        };
+        let (mut client, mut proxy) = tcp_stream_pair()
+            .await
+            .expect("create auth-rejection SOCKS5 stream pair");
+        let proxy_task = tokio::spawn(async move {
+            let mut greeting = [0_u8; 3];
+            proxy
+                .read_exact(&mut greeting)
+                .await
+                .expect("read authenticated SOCKS5 greeting");
+            proxy
+                .write_all(&[0x05, 0x02])
+                .await
+                .expect("select SOCKS5 username/password method");
+            let mut auth = [0_u8; 12];
+            proxy
+                .read_exact(&mut auth)
+                .await
+                .expect("read SOCKS5 username/password request");
+            assert_eq!(&auth, b"\x01\x04user\x05wrong");
+            proxy
+                .write_all(&[0x01, 0x01])
+                .await
+                .expect("write SOCKS5 authentication rejection");
+            proxy.flush().await.expect("flush SOCKS5 auth rejection");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            socks5_negotiate_auth(&mut client, &authenticated),
+        )
+        .await
+        .expect("authentication rejection response timeout")
+        .expect_err("rejected username/password must fail");
+        assert!(matches!(
+            error,
+            TransportError::Socks5Proxy {
+                stage: "username/password auth",
+                ..
+            }
+        ));
+        tokio::time::timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("auth rejection proxy task timeout")
+            .expect("auth rejection proxy task joins");
+    }
+
+    #[test]
+    fn socks5_target_encoding_covers_ipv4_ipv6_domain_and_length_limit() {
+        let cases = [
+            (
+                OwnedProxyHeader {
+                    network: Network::Tcp,
+                    address: OwnedProxyAddress::Ipv4(
+                        "192.0.2.1".parse().expect("parse IPv4 SOCKS5 target"),
+                    ),
+                    port: 443,
+                },
+                vec![0x01, 192, 0, 2, 1, 0x01, 0xbb],
+            ),
+            (
+                OwnedProxyHeader {
+                    network: Network::Tcp,
+                    address: OwnedProxyAddress::Ipv6(
+                        "2001:db8::1".parse().expect("parse IPv6 SOCKS5 target"),
+                    ),
+                    port: 53,
+                },
+                {
+                    let mut expected = vec![0x04];
+                    expected.extend_from_slice(
+                        &"2001:db8::1"
+                            .parse::<std::net::Ipv6Addr>()
+                            .expect("parse expected IPv6 SOCKS5 target")
+                            .octets(),
+                    );
+                    expected.extend_from_slice(&53_u16.to_be_bytes());
+                    expected
+                },
+            ),
+            (
+                OwnedProxyHeader {
+                    network: Network::Tcp,
+                    address: OwnedProxyAddress::Domain("example.com".to_owned()),
+                    port: 8080,
+                },
+                b"\x03\x0bexample.com\x1f\x90".to_vec(),
+            ),
+        ];
+        for (header, expected) in cases {
+            let mut encoded = Vec::new();
+            encode_socks5_target(&header, &mut encoded).expect("encode SOCKS5 target");
+            assert_eq!(encoded, expected);
+        }
+
+        let oversized = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Domain("x".repeat(256)),
+            port: 80,
+        };
+        let error = encode_socks5_target(&oversized, &mut Vec::new())
+            .expect_err("256-byte domain must not fit SOCKS5 framing");
+        assert!(matches!(
+            error,
+            TransportError::Socks5Proxy {
+                stage: "connect",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_rejects_failure_malformed_and_reserved_replies() {
+        let link = Socks5DialerLink {
+            host: "127.0.0.1".to_owned(),
+            port: 1080,
+            username: None,
+            password: None,
+        };
+        let header = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+            port: 80,
+        };
+        for response in [
+            [0x05, 0x05, 0x00, 0x01],
+            [0x04, 0x00, 0x00, 0x01],
+            [0x05, 0x00, 0x01, 0x01],
+        ] {
+            let (mut client, mut proxy) = tcp_stream_pair()
+                .await
+                .expect("create invalid-reply SOCKS5 stream pair");
+            let proxy_task = tokio::spawn(async move {
+                let mut greeting = [0_u8; 3];
+                proxy
+                    .read_exact(&mut greeting)
+                    .await
+                    .expect("read SOCKS5 greeting before invalid reply");
+                proxy
+                    .write_all(&[0x05, 0x00])
+                    .await
+                    .expect("select no-auth SOCKS5 method");
+                let mut request = [0_u8; 10];
+                proxy
+                    .read_exact(&mut request)
+                    .await
+                    .expect("read SOCKS5 CONNECT request");
+                proxy
+                    .write_all(&response)
+                    .await
+                    .expect("write invalid SOCKS5 CONNECT response");
+                proxy.flush().await.expect("flush invalid CONNECT response");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                socks5_connect(&mut client, &header, &link),
+            )
+            .await
+            .expect("invalid CONNECT response timeout")
+            .expect_err("invalid CONNECT reply must fail");
+            assert!(
+                matches!(
+                    error,
+                    TransportError::Socks5Proxy {
+                        stage: "connect",
+                        ..
+                    }
+                ),
+                "unexpected CONNECT error for {response:?}: {error:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(2), proxy_task)
+                .await
+                .expect("invalid reply proxy task timeout")
+                .expect("invalid reply proxy task joins");
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_associate_uses_rfc1929_auth_and_accepts_domain_relay_address()
+    -> Result<(), TransportError> {
+        let link = Socks5DialerLink {
+            host: "127.0.0.1".to_owned(),
+            port: 1080,
+            username: Some("udp-user".to_owned()),
+            password: Some("udp-password".to_owned()),
+        };
+        let (mut client, mut proxy) = tcp_stream_pair().await?;
+        let proxy_task = tokio::spawn(async move {
+            let mut greeting = [0_u8; 3];
+            proxy.read_exact(&mut greeting).await?;
+            assert_eq!(greeting, [0x05, 0x01, 0x02]);
+            proxy.write_all(&[0x05, 0x02]).await?;
+
+            let mut auth = [0_u8; 23];
+            proxy.read_exact(&mut auth).await?;
+            assert_eq!(&auth, b"\x01\x08udp-user\x0cudp-password");
+            proxy.write_all(&[0x01, 0x00]).await?;
+
+            let mut associate = [0_u8; 10];
+            proxy.read_exact(&mut associate).await?;
+            assert_eq!(associate, [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            proxy
+                .write_all(b"\x05\x00\x00\x03\x09localhost\xa4\x10")
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let relay =
+            socks5_udp_associate(&mut client, &link, SocketAddr::from(([127, 0, 0, 1], 1080)))
+                .await?;
+        assert!(relay.ip().is_loopback());
+        assert_eq!(relay.port(), 42000);
+        proxy_task.await.expect("UDP ASSOCIATE proxy task joins")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_domain_resolution_matches_udp_socket_family() -> Result<(), TransportError> {
+        let ipv4 = resolve_socks5_domain_address("localhost", 1080, true).await?;
+        assert!(ipv4.is_ipv4());
+        if let Ok(ipv6) = resolve_socks5_domain_address("localhost", 1080, false).await {
+            assert!(ipv6.is_ipv6());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an external SOCKS5 proxy and HTTP target"]
+    async fn external_socks5_authenticated_tcp_interop() -> Result<(), TransportError> {
+        let proxy_url = std::env::var("ZUICITY_EXTERNAL_SOCKS5_URL")
+            .expect("ZUICITY_EXTERNAL_SOCKS5_URL must identify the external proxy");
+        let target_host = std::env::var("ZUICITY_EXTERNAL_SOCKS5_TARGET_HOST")
+            .expect("ZUICITY_EXTERNAL_SOCKS5_TARGET_HOST must identify the HTTP target");
+        let target_port = std::env::var("ZUICITY_EXTERNAL_SOCKS5_TARGET_PORT")
+            .expect("ZUICITY_EXTERNAL_SOCKS5_TARGET_PORT must identify the HTTP target port")
+            .parse::<u16>()
+            .expect("external SOCKS5 target port must be a u16");
+        let header = OwnedProxyHeader {
+            network: Network::Tcp,
+            address: OwnedProxyAddress::Domain(target_host.clone()),
+            port: target_port,
+        };
+        let dialer_link = ProxyDialerLink::parse(&proxy_url)?;
+        let mut stream = connect_tcp_proxy_target_with_egress(
+            &header,
+            ProxyEgressPolicy::with_send_through_fwmark_and_dialer_link(
+                None,
+                None,
+                Some(dialer_link),
+            ),
+        )
+        .await?;
+        stream
+            .write_all(
+                format!(
+                    "GET /status/204 HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("external SOCKS5 HTTP response timeout")?;
+        assert!(
+            response.starts_with(b"HTTP/1.1 204") || response.starts_with(b"HTTP/1.0 204"),
+            "unexpected response through external SOCKS5 proxy: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut parsed = url::Url::parse(&proxy_url).expect("external SOCKS5 URL parses");
+        parsed
+            .set_password(Some("wrong-password"))
+            .expect("SOCKS5 URL accepts a replacement password");
+        let wrong_credentials = ProxyDialerLink::parse(parsed.as_str())?;
+        let error = match connect_tcp_proxy_target_with_egress(
+            &header,
+            ProxyEgressPolicy::with_send_through_fwmark_and_dialer_link(
+                None,
+                None,
+                Some(wrong_credentials),
+            ),
+        )
+        .await
+        {
+            Ok(_) => panic!("external SOCKS5 proxy accepted the wrong password"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TransportError::Socks5Proxy {
+                stage: "username/password auth",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_reply_address_rejects_failure_reserved_and_unknown_address_type() {
+        for response in [
+            [0x05, 0x07, 0x00, 0x01],
+            [0x05, 0x00, 0x01, 0x01],
+            [0x05, 0x00, 0x00, 0xff],
+        ] {
+            let (mut client, mut proxy) = tcp_stream_pair()
+                .await
+                .expect("create invalid-address SOCKS5 stream pair");
+            let proxy_task = tokio::spawn(async move {
+                proxy
+                    .write_all(&response)
+                    .await
+                    .expect("write invalid SOCKS5 reply address");
+                proxy.flush().await.expect("flush invalid reply address");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+            let error = read_socks5_reply_addr(&mut client, "udp associate", true)
+                .await
+                .expect_err("invalid SOCKS5 reply address must fail");
+            assert!(matches!(
+                error,
+                TransportError::Socks5Proxy {
+                    stage: "udp associate",
+                    ..
+                }
+            ));
+            proxy_task.await.expect("invalid reply-address task joins");
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_relay_ignores_forged_response_from_unnegotiated_source()
+    -> Result<(), TransportError> {
+        let client = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let relay_addr = relay.local_addr()?;
+        let attacker = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let target: SocketAddr = "192.0.2.1:53"
+            .parse()
+            .expect("parse SOCKS5 spoof-test target");
+        let header = OwnedProxyHeader::from_ip(Network::Udp, target.ip(), target.port());
+        let encoded_header = encode_socks5_udp_datagram(&header, b"")?;
+        let relay_task = tokio::spawn(async move {
+            let mut request = [0_u8; 1024];
+            let (_, client_addr) = relay.recv_from(&mut request).await?;
+            let mut forged = encoded_header.clone();
+            forged.extend_from_slice(b"forged");
+            attacker.send_to(&forged, client_addr).await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut legitimate = encoded_header;
+            legitimate.extend_from_slice(b"legitimate");
+            relay.send_to(&legitimate, client_addr).await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let socket = Socks5UdpRelaySocket::Direct(client);
+        let (reported_target, peer, payload) = relay_udp_payload_to_target_with_socks5_association(
+            &header, b"request", &socket, relay_addr,
+        )
+        .await?;
+        assert_eq!(reported_target, target);
+        assert_eq!(peer, target);
+        assert_eq!(payload, b"legitimate");
+        relay_task.await.expect("SOCKS5 spoof-test relay joins")?;
+        Ok(())
+    }
+
+    #[test]
+    fn socks5_udp_codec_covers_address_types_and_rejects_malformed_frames() {
+        let ipv4 = [0, 0, 0, 1, 192, 0, 2, 1, 0x1f, 0x90, 1, 2];
+        assert_eq!(
+            decode_socks5_udp_response_header(&ipv4).expect("decode IPv4 SOCKS5 UDP response"),
+            (
+                Socks5UdpResponseAddress::Ip(
+                    "192.0.2.1:8080"
+                        .parse()
+                        .expect("parse expected IPv4 SOCKS5 UDP peer"),
+                ),
+                10,
+            )
+        );
+        let mut ipv6 = vec![0, 0, 0, 4];
+        ipv6.extend_from_slice(
+            &"2001:db8::1"
+                .parse::<std::net::Ipv6Addr>()
+                .expect("parse IPv6 SOCKS5 UDP response peer")
+                .octets(),
+        );
+        ipv6.extend_from_slice(&53_u16.to_be_bytes());
+        assert_eq!(
+            decode_socks5_udp_response_header(&ipv6).expect("decode IPv6 SOCKS5 UDP response"),
+            (
+                Socks5UdpResponseAddress::Ip(
+                    "[2001:db8::1]:53"
+                        .parse()
+                        .expect("parse expected IPv6 SOCKS5 UDP peer"),
+                ),
+                22,
+            )
+        );
+
+        let domain = b"\x00\x00\x00\x03\x09localhost\x00\x35payload";
+        assert_eq!(
+            decode_socks5_udp_response_header(domain).expect("decode domain SOCKS5 UDP response"),
+            (
+                Socks5UdpResponseAddress::Domain {
+                    domain: "localhost".to_owned(),
+                    port: 53,
+                },
+                16,
+            )
+        );
+
+        for malformed in [
+            vec![],
+            vec![0, 0, 1, 1, 127, 0, 0, 1, 0, 53],
+            vec![0, 0, 0, 1, 127],
+            vec![0, 0, 0, 4, 0],
+            vec![0, 0, 0, 3, 0, 0, 53],
+            vec![0, 0, 0, 3, 9, b'l'],
+            vec![0, 0, 0, 0xff],
+        ] {
+            assert!(
+                matches!(
+                    decode_socks5_udp_response_header(&malformed),
+                    Err(TransportError::Socks5Proxy {
+                        stage: "udp relay",
+                        ..
+                    })
+                ),
+                "malformed datagram unexpectedly accepted: {malformed:?}"
+            );
+        }
     }
 
     #[test]
@@ -12803,35 +13514,33 @@ mod tests {
         assert!(policy.tls13_or_newer);
     }
 
-    fn short_header_transmit(dest: SocketAddr, segment: usize, segments: usize) -> Vec<u8> {
+    #[cfg(target_os = "linux")]
+    fn short_header_transmit(segment: usize, segments: usize) -> Vec<u8> {
         // Short-header QUIC packets clear the high bit (0x80) of the first byte.
         // Build `segments` chunks of `segment` bytes each; first byte 0x40.
         let mut contents = vec![0x55_u8; segment * segments];
         for index in 0..segments {
             contents[index * segment] = 0x40;
         }
-        let _ = dest;
         contents
     }
 
     #[tokio::test]
-    async fn gso_fallback_resends_both_datagrams_and_marks_dest_disabled() -> std::io::Result<()> {
-        // Test A: force the first GSO sendmsg to EINVAL and assert the same-call
-        // fallback delivers BOTH datagrams while the destination is disabled.
+    #[cfg(target_os = "linux")]
+    async fn explicit_auto_mode_emits_one_gso_send_and_delivers_each_segment() -> std::io::Result<()>
+    {
         let receiver = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         receiver.set_nonblocking(true)?;
         let dest = receiver.local_addr()?;
 
         let sender_std = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let socket = PlainUdpSocket::with_mode_and_hook(
+        let socket = PlainUdpSocket::with_test_config(
             sender_std,
-            GsoMode::Auto,
-            GsoTestHook::FirstEinval,
+            PlainUdpTestConfig::new(GsoMode::Auto, GroMode::Off),
         )?;
-        let counters = socket.counters();
 
         let segment = 1200;
-        let contents = short_header_transmit(dest, segment, 2);
+        let contents = short_header_transmit(segment, 2);
         let transmit = quinn::udp::Transmit {
             destination: dest,
             ecn: None,
@@ -12848,7 +13557,7 @@ mod tests {
         while received < 2 && std::time::Instant::now() < deadline {
             match receiver.recv_from(&mut buf) {
                 Ok((len, _)) => {
-                    assert_eq!(len, segment, "each fallback datagram is one segment");
+                    assert_eq!(len, segment, "each datagram is one segment");
                     received += 1;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -12858,31 +13567,94 @@ mod tests {
             }
         }
 
-        assert_eq!(received, 2, "both datagrams delivered after fallback");
-        assert_eq!(counters.attempt.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.fallback.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.plain_after_fallback.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.long_header_gso_attempt.load(Ordering::Relaxed), 0);
-        assert_eq!(socket.gso_dest_state(dest), GsoDestState::Disabled);
+        assert_eq!(received, 2, "both GSO segments are delivered as datagrams");
+        let gso = socket.counters();
+        assert_eq!(gso.attempt.load(Ordering::Relaxed), 1);
+        assert_eq!(gso.success.load(Ordering::Relaxed), 1);
+        assert_eq!(gso.fallback.load(Ordering::Relaxed), 0);
+        assert_eq!(socket.gso_dest_state(dest), GsoDestState::Working);
+        let plain = socket.plain_counters();
+        assert_eq!(plain.sendmmsg_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(plain.sendmmsg_datagrams.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_gso_rejection_falls_back_without_loss(
+        hook: GsoTestHook,
+    ) -> std::io::Result<()> {
+        let receiver = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        receiver.set_nonblocking(true)?;
+        let destination = receiver.local_addr()?;
+        let sender = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let mut config = PlainUdpTestConfig::new(GsoMode::Auto, GroMode::Off);
+        config.gso_hook = hook;
+        let socket = PlainUdpSocket::with_test_config(sender, config)?;
+        let segment = 1200;
+        let contents = short_header_transmit(segment, 2);
+        let transmit = quinn::udp::Transmit {
+            destination,
+            ecn: None,
+            contents: &contents,
+            segment_size: Some(segment),
+            src_ip: None,
+        };
+
+        quinn::AsyncUdpSocket::try_send(&socket, &transmit)?;
+
+        let mut payloads = Vec::new();
+        let mut buffer = [0_u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while payloads.len() < 2 && std::time::Instant::now() < deadline {
+            match receiver.recv_from(&mut buffer) {
+                Ok((length, _)) => payloads.push(buffer[..length].to_vec()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        assert_eq!(
+            payloads,
+            [&contents[..segment], &contents[segment..]].map(<[u8]>::to_vec)
+        );
+        let gso = socket.counters();
+        assert_eq!(gso.attempt.load(Ordering::Relaxed), 1);
+        assert_eq!(gso.success.load(Ordering::Relaxed), 0);
+        assert_eq!(gso.fallback.load(Ordering::Relaxed), 1);
+        assert_eq!(gso.plain_after_fallback.load(Ordering::Relaxed), 1);
+        assert_eq!(socket.gso_dest_state(destination), GsoDestState::Disabled);
+        let plain = socket.plain_counters();
+        assert_eq!(plain.sendmmsg_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(plain.sendmmsg_datagrams.load(Ordering::Relaxed), 2);
         Ok(())
     }
 
     #[tokio::test]
-    async fn long_header_transmit_is_never_segmented_even_when_gso_working() -> std::io::Result<()>
-    {
-        // Test C: a batched transmit whose first byte has 0x80 set is sent as
-        // plain datagrams even when GSO is otherwise eligible/working.
+    #[cfg(target_os = "linux")]
+    async fn gso_einval_falls_back_to_plain_datagrams_without_loss() -> std::io::Result<()> {
+        assert_gso_rejection_falls_back_without_loss(GsoTestHook::AlwaysEinval).await
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn gso_eio_falls_back_to_plain_datagrams_without_loss() -> std::io::Result<()> {
+        assert_gso_rejection_falls_back_without_loss(GsoTestHook::AlwaysEio).await
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn long_header_transmit_is_sent_as_ordinary_datagrams() -> std::io::Result<()> {
         let receiver = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         receiver.set_nonblocking(true)?;
         let dest = receiver.local_addr()?;
 
         let sender_std = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let socket =
-            PlainUdpSocket::with_mode_and_hook(sender_std, GsoMode::Auto, GsoTestHook::None)?;
-        // Pre-mark the destination Working so only the long-header guard can
-        // route this transmit to the plain path.
-        socket.set_dest_state(dest, GsoDestState::Working);
-        let counters = socket.counters();
+        let socket = PlainUdpSocket::with_test_config(
+            sender_std,
+            PlainUdpTestConfig::new(GsoMode::Auto, GroMode::Off),
+        )?;
 
         let segment = 1200;
         let mut contents = vec![0x55_u8; segment * 2];
@@ -12921,25 +13693,23 @@ mod tests {
             received, 2,
             "long-header transmit delivered as two plain datagrams"
         );
-        assert_eq!(
-            counters.attempt.load(Ordering::Relaxed),
-            0,
-            "no GSO attempt for a long-header transmit"
-        );
-        assert_eq!(counters.long_header_gso_attempt.load(Ordering::Relaxed), 0);
+        let counters = socket.plain_counters();
+        assert_eq!(counters.sendmmsg_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.sendmmsg_datagrams.load(Ordering::Relaxed), 2);
+        let gso = socket.counters();
+        assert_eq!(gso.attempt.load(Ordering::Relaxed), 0);
+        assert_eq!(gso.success.load(Ordering::Relaxed), 0);
         Ok(())
     }
 
-    fn build_hooked_endpoint(
+    fn build_strict_gso_zero_endpoint(
         addr: SocketAddr,
         server_config: Option<quinn::ServerConfig>,
-        hook: GsoTestHook,
     ) -> Result<(quinn::Endpoint, Arc<PlainUdpSocket>), TransportError> {
         let std_socket = std::net::UdpSocket::bind(addr)?;
-        let socket = Arc::new(PlainUdpSocket::with_mode_and_hook(
+        let socket = Arc::new(PlainUdpSocket::with_test_config(
             std_socket,
-            GsoMode::Auto,
-            hook,
+            PlainUdpTestConfig::new(GsoMode::Off, GroMode::Off),
         )?);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
@@ -12953,11 +13723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_survives_gso_hostile_path_and_never_segments_long_header()
-    -> Result<(), TransportError> {
-        // Test B: every GSO attempt fails (AlwaysEinval) yet a real cross-socket
-        // QUIC handshake + small echo succeeds, and no long-header packet ever
-        // reaches the GSO path.
+    async fn strict_gso_zero_path_preserves_handshake_and_echo() -> Result<(), TransportError> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate fixture cert");
         let server_crypto = build_server_crypto_config_from_pem(
@@ -12971,11 +13737,8 @@ mod tests {
             build_transport_config(&QuicRuntimePolicy::upstream_server()).into_arc(),
         );
 
-        let (server_endpoint, server_socket) = build_hooked_endpoint(
-            ([127, 0, 0, 1], 0).into(),
-            Some(server_config),
-            GsoTestHook::AlwaysEinval,
-        )?;
+        let (server_endpoint, _server_socket) =
+            build_strict_gso_zero_endpoint(([127, 0, 0, 1], 0).into(), Some(server_config))?;
         let server_addr = server_endpoint.local_addr()?;
 
         let server_task = tokio::spawn(async move {
@@ -13005,8 +13768,8 @@ mod tests {
             build_transport_config(&QuicRuntimePolicy::upstream_client()).into_arc(),
         );
 
-        let (client_endpoint, client_socket) =
-            build_hooked_endpoint(([127, 0, 0, 1], 0).into(), None, GsoTestHook::AlwaysEinval)?;
+        let (client_endpoint, _client_socket) =
+            build_strict_gso_zero_endpoint(([127, 0, 0, 1], 0).into(), None)?;
         let connection = client_endpoint
             .connect_with(client_config, server_addr, "localhost")?
             .await?;
@@ -13021,41 +13784,19 @@ mod tests {
         let server_read = server_task.await??;
         assert_eq!(server_read, probe.len());
 
-        assert_eq!(
-            client_socket
-                .counters()
-                .long_header_gso_attempt
-                .load(Ordering::Relaxed),
-            0,
-            "client never attempted GSO on a long-header packet"
-        );
-        assert_eq!(
-            server_socket
-                .counters()
-                .long_header_gso_attempt
-                .load(Ordering::Relaxed),
-            0,
-            "server never attempted GSO on a long-header packet"
-        );
-        assert_eq!(
-            client_socket.counters().success.load(Ordering::Relaxed),
-            0,
-            "all GSO attempts failed yet the handshake still completed"
-        );
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn build_gro_endpoint(
         addr: SocketAddr,
         server_config: Option<quinn::ServerConfig>,
         gro_mode: GroMode,
     ) -> Result<(quinn::Endpoint, Arc<PlainUdpSocket>), TransportError> {
         let std_socket = std::net::UdpSocket::bind(addr)?;
-        let socket = Arc::new(PlainUdpSocket::with_modes_and_hook(
+        let socket = Arc::new(PlainUdpSocket::with_test_config(
             std_socket,
-            GsoMode::Auto,
-            gro_mode,
-            GsoTestHook::None,
+            PlainUdpTestConfig::new(GsoMode::Off, gro_mode),
         )?);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
@@ -13068,6 +13809,7 @@ mod tests {
         Ok((endpoint, socket))
     }
 
+    #[cfg(target_os = "linux")]
     async fn run_gro_bulk_transfer(
         gro_mode: GroMode,
     ) -> Result<(Arc<PlainUdpSocket>, usize, u16), TransportError> {
@@ -13189,6 +13931,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gro_disabled_path_transfers_without_coalescing() -> Result<(), TransportError> {
         // With GRO Off the same bulk transfer must still round-trip byte-exact,

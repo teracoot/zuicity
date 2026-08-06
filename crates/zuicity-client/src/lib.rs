@@ -13,7 +13,8 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zuicity_config::ClientConfig;
 use zuicity_transport::{
-    DEFAULT_NAT_TIMEOUT, JuicityQuicClient, StreamPolicy, TlsPolicy, UdpOverStream,
+    CongestionController, DEFAULT_NAT_TIMEOUT, JuicityQuicClient, QuicRuntimePolicy, StreamPolicy,
+    TlsPolicy, UdpOverStream,
 };
 
 const MIXED_SHUTDOWN_RELAY_DRAIN_GRACE: Duration = Duration::from_millis(25);
@@ -211,6 +212,14 @@ impl ClientRuntime {
     }
 
     fn quic_dialer_params(&self, roots_pem: &[u8]) -> QuicDialerParams {
+        let mut policy = QuicRuntimePolicy::upstream_client();
+        policy.streams = self.config.streams.clone();
+        policy.congestion_controller = CongestionController::from_config_name(
+            self.config
+                .config
+                .congestion_control
+                .map(zuicity_config::CongestionControl::as_str),
+        );
         QuicDialerParams {
             server_addr: self.config.config.raw.server.clone(),
             server_name: self.config.config.tls_server_name().into_owned(),
@@ -218,6 +227,7 @@ impl ClientRuntime {
             allow_insecure: self.config.config.raw.allow_insecure,
             uuid: self.config.config.uuid,
             password: self.config.config.raw.password.as_bytes().to_vec(),
+            policy,
         }
     }
 
@@ -408,7 +418,7 @@ impl MixedTcpListener {
         local_peer: SocketAddr,
         tcp_relays: &mut tokio::task::JoinSet<Result<MixedTcpReport, ClientError>>,
         udp_relays: &mut tokio::task::JoinSet<Result<Socks5UdpAssociateReport, ClientError>>,
-        pending_udp_relays: &mut VecDeque<tokio::sync::mpsc::Sender<Socks5UdpInboundDatagram>>,
+        pending_udp_relays: &mut VecDeque<PendingSocks5UdpRelay>,
     ) -> Result<(), ClientError> {
         let mut first = [0_u8; 1];
         let peeked = match local_stream.peek(&mut first).await {
@@ -439,7 +449,16 @@ impl MixedTcpListener {
                         Ok(())
                     }
                     0x03 => {
-                        discard_socks5_address_and_port(&mut local_stream, address_type).await?;
+                        validate_socks5_command_and_address_type(
+                            &mut local_stream,
+                            command,
+                            0x03,
+                            address_type,
+                        )
+                        .await?;
+                        let requested_endpoint =
+                            read_socks5_udp_client_endpoint(&mut local_stream, address_type)
+                                .await?;
                         write_socks5_success_response(
                             &mut local_stream,
                             self.udp_socket.local_addr()?,
@@ -452,10 +471,17 @@ impl MixedTcpListener {
                                 .relay_socks5_udp_association(local_stream, local_peer, datagram_rx)
                                 .await
                         });
-                        pending_udp_relays.push_back(datagram_tx);
+                        pending_udp_relays.push_back(PendingSocks5UdpRelay {
+                            control_ip: local_peer.ip(),
+                            requested_endpoint,
+                            route: datagram_tx,
+                        });
                         Ok(())
                     }
-                    other => Err(ClientError::UnsupportedSocks5Command(other)),
+                    other => {
+                        write_socks5_failure_response(&mut local_stream, 0x07).await?;
+                        Err(ClientError::UnsupportedSocks5Command(other))
+                    }
                 }
             }
         }
@@ -478,15 +504,20 @@ impl MixedTcpListener {
         &self,
     ) -> Result<Socks5UdpAssociateReport, ClientError> {
         let (mut control_stream, control_peer) = self.listener.accept().await?;
-        read_socks5_udp_associate_request(&mut control_stream).await?;
-        self.relay_one_socks5_udp_associate_datagram(control_stream, control_peer)
-            .await
+        let requested_endpoint = read_socks5_udp_associate_request(&mut control_stream).await?;
+        self.relay_one_socks5_udp_associate_datagram(
+            control_stream,
+            control_peer,
+            requested_endpoint,
+        )
+        .await
     }
 
     async fn relay_one_socks5_udp_associate_datagram(
         &self,
         mut control_stream: tokio::net::TcpStream,
         control_peer: SocketAddr,
+        requested_endpoint: Socks5UdpClientEndpoint,
     ) -> Result<Socks5UdpAssociateReport, ClientError> {
         let udp_local_addr = self.udp_socket.local_addr()?;
         write_socks5_success_response(&mut control_stream, udp_local_addr).await?;
@@ -511,6 +542,9 @@ impl MixedTcpListener {
                 }
                 received = self.udp_socket.recv_from(&mut datagram) => {
                     let (received, udp_peer) = received?;
+                    if !requested_endpoint.matches(control_peer.ip(), udp_peer) {
+                        continue;
+                    }
                     match first_udp_peer {
                         Some(peer) if peer != udp_peer => continue,
                         Some(_) => {}
@@ -710,6 +744,13 @@ struct Socks5UdpInboundDatagram {
     datagram: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct PendingSocks5UdpRelay {
+    control_ip: IpAddr,
+    requested_endpoint: Socks5UdpClientEndpoint,
+    route: tokio::sync::mpsc::Sender<Socks5UdpInboundDatagram>,
+}
+
 impl MixedUdpRelayRuntime {
     async fn relay_socks5_udp_association(
         &self,
@@ -801,7 +842,7 @@ impl MixedUdpRelayRuntime {
 async fn route_mixed_socks5_udp_datagram(
     udp_peer: SocketAddr,
     mut datagram: Vec<u8>,
-    pending_udp_relays: &mut VecDeque<tokio::sync::mpsc::Sender<Socks5UdpInboundDatagram>>,
+    pending_udp_relays: &mut VecDeque<PendingSocks5UdpRelay>,
     udp_routes: &mut HashMap<SocketAddr, tokio::sync::mpsc::Sender<Socks5UdpInboundDatagram>>,
 ) {
     if let Some(route) = udp_routes.get(&udp_peer).cloned() {
@@ -817,16 +858,26 @@ async fn route_mixed_socks5_udp_datagram(
         }
     }
 
-    while let Some(route) = pending_udp_relays.pop_front() {
-        if route.is_closed() {
+    let mut unmatched = VecDeque::new();
+    while let Some(pending) = pending_udp_relays.pop_front() {
+        if pending.route.is_closed() {
             continue;
         }
-        match route
+        if !pending
+            .requested_endpoint
+            .matches(pending.control_ip, udp_peer)
+        {
+            unmatched.push_back(pending);
+            continue;
+        }
+        match pending
+            .route
             .send(Socks5UdpInboundDatagram { udp_peer, datagram })
             .await
         {
             Ok(()) => {
-                udp_routes.insert(udp_peer, route);
+                udp_routes.insert(udp_peer, pending.route);
+                pending_udp_relays.append(&mut unmatched);
                 return;
             }
             Err(error) => {
@@ -834,6 +885,7 @@ async fn route_mixed_socks5_udp_datagram(
             }
         }
     }
+    pending_udp_relays.append(&mut unmatched);
 }
 
 /// Connection parameters shared by every forwarder dial.
@@ -848,6 +900,7 @@ struct QuicDialerParams {
     allow_insecure: bool,
     uuid: uuid::Uuid,
     password: Vec<u8>,
+    policy: QuicRuntimePolicy,
 }
 
 /// Lazily-established, auto-reconnecting authenticated QUIC connection reused
@@ -912,7 +965,10 @@ impl SharedQuicDialer {
 
     async fn dial(&self) -> Result<CachedQuicConnection, ClientError> {
         let server_addr = parse_client_server_addr(&self.params.server_addr)?;
-        let client = JuicityQuicClient::bind(client_dialer_bind_addr(server_addr))?;
+        let client = JuicityQuicClient::bind_with_policy(
+            client_dialer_bind_addr(server_addr),
+            &self.params.policy,
+        )?;
         let connection = client
             .connect_with_roots(
                 server_addr,
@@ -1212,6 +1268,7 @@ async fn read_socks5_request_header(
     let mut header = [0_u8; 4];
     stream.read_exact(&mut header).await?;
     if header[0] != 0x05 || header[2] != 0x00 {
+        write_socks5_failure_response(stream, 0x01).await?;
         return Err(ClientError::InvalidSocks5Request);
     }
     Ok((header[1], header[3]))
@@ -1257,31 +1314,60 @@ async fn read_socks5_connect_target(
 ) -> Result<TcpForwardTarget, ClientError> {
     read_socks5_greeting(stream).await?;
     let (command, address_type) = read_socks5_request_header(stream).await?;
-    if command != 0x01 {
-        return Err(ClientError::UnsupportedSocks5Command(command));
-    }
+    validate_socks5_command_and_address_type(stream, command, 0x01, address_type).await?;
     read_socks5_tcp_target(stream, address_type).await
 }
 
 async fn read_socks5_udp_associate_request(
     stream: &mut tokio::net::TcpStream,
-) -> Result<(), ClientError> {
+) -> Result<Socks5UdpClientEndpoint, ClientError> {
     read_socks5_greeting(stream).await?;
     let (command, address_type) = read_socks5_request_header(stream).await?;
-    if command != 0x03 {
-        return Err(ClientError::UnsupportedSocks5Command(command));
-    }
-    discard_socks5_address_and_port(stream, address_type).await
+    validate_socks5_command_and_address_type(stream, command, 0x03, address_type).await?;
+    read_socks5_udp_client_endpoint(stream, address_type).await
 }
 
-async fn discard_socks5_address_and_port(
+async fn validate_socks5_command_and_address_type(
+    stream: &mut tokio::net::TcpStream,
+    command: u8,
+    expected_command: u8,
+    address_type: u8,
+) -> Result<(), ClientError> {
+    if command != expected_command {
+        write_socks5_failure_response(stream, 0x07).await?;
+        return Err(ClientError::UnsupportedSocks5Command(command));
+    }
+    if !matches!(address_type, 0x01 | 0x03 | 0x04) {
+        write_socks5_failure_response(stream, 0x08).await?;
+        return Err(ClientError::InvalidSocks5Request);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Socks5UdpClientEndpoint {
+    ip: Option<IpAddr>,
+    port: u16,
+}
+
+impl Socks5UdpClientEndpoint {
+    fn matches(self, control_ip: IpAddr, udp_peer: SocketAddr) -> bool {
+        udp_peer.ip() == control_ip
+            && self.ip.is_none_or(|ip| ip == udp_peer.ip())
+            && (self.port == 0 || self.port == udp_peer.port())
+    }
+}
+
+async fn read_socks5_udp_client_endpoint(
     stream: &mut tokio::net::TcpStream,
     atyp: u8,
-) -> Result<(), ClientError> {
-    match atyp {
+) -> Result<Socks5UdpClientEndpoint, ClientError> {
+    let ip = match atyp {
         0x01 => {
             let mut addr = [0_u8; 4];
             stream.read_exact(&mut addr).await?;
+            let ip = IpAddr::V4(Ipv4Addr::from(addr));
+            (!ip.is_unspecified()).then_some(ip)
         }
         0x03 => {
             let mut len = [0_u8; 1];
@@ -1291,14 +1377,27 @@ async fn discard_socks5_address_and_port(
             }
             let mut domain = vec![0_u8; len[0] as usize];
             stream.read_exact(&mut domain).await?;
+            None
         }
         0x04 => {
             let mut addr = [0_u8; 16];
             stream.read_exact(&mut addr).await?;
+            let ip = IpAddr::V6(Ipv6Addr::from(addr));
+            (!ip.is_unspecified()).then_some(ip)
         }
         _ => return Err(ClientError::InvalidSocks5Request),
-    }
-    let _ = read_network_port(stream).await?;
+    };
+    let port = read_network_port(stream).await?;
+    Ok(Socks5UdpClientEndpoint { ip, port })
+}
+
+async fn write_socks5_failure_response(
+    stream: &mut tokio::net::TcpStream,
+    reply: u8,
+) -> Result<(), ClientError> {
+    stream
+        .write_all(&[0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     Ok(())
 }
 
@@ -1930,6 +2029,218 @@ pub enum ClientError {
 mod tests {
     use super::*;
 
+    async fn tcp_stream_pair() -> std::io::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let client = tokio::net::TcpStream::connect(addr);
+        let server = listener.accept();
+        let (client, (server, _)) = tokio::try_join!(client, server)?;
+        Ok((client, server))
+    }
+
+    #[tokio::test]
+    async fn socks5_greeting_rejects_unsupported_auth_with_no_acceptable_method_reply()
+    -> Result<(), ClientError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = tcp_stream_pair().await?;
+        let server_task = tokio::spawn(async move { read_socks5_greeting(&mut server).await });
+        client.write_all(&[0x05, 0x02, 0x01, 0x02]).await?;
+        let mut response = [0_u8; 2];
+        client.read_exact(&mut response).await?;
+        assert_eq!(response, [0x05, 0xff]);
+        assert!(matches!(
+            server_task.await?,
+            Err(ClientError::UnsupportedSocks5Auth)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_parser_accepts_domain_and_ipv6_targets_and_rejects_bind()
+    -> Result<(), ClientError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cases = [
+            (
+                b"\x05\x01\x00\x03\x0bexample.com\x01\xbb".to_vec(),
+                TcpForwardTarget::Domain {
+                    domain: "example.com".to_owned(),
+                    port: 443,
+                },
+            ),
+            (
+                {
+                    let mut request = b"\x05\x01\x00\x04".to_vec();
+                    request.extend_from_slice(
+                        &"2001:db8::1"
+                            .parse::<Ipv6Addr>()
+                            .expect("parse IPv6 SOCKS5 target")
+                            .octets(),
+                    );
+                    request.extend_from_slice(&53_u16.to_be_bytes());
+                    request
+                },
+                TcpForwardTarget::Ip(
+                    "[2001:db8::1]:53"
+                        .parse()
+                        .expect("parse IPv6 SOCKS5 target endpoint"),
+                ),
+            ),
+        ];
+        for (request, expected) in cases {
+            let (mut client, mut server) = tcp_stream_pair().await?;
+            let server_task =
+                tokio::spawn(async move { read_socks5_connect_target(&mut server).await });
+            client.write_all(&[0x05, 0x01, 0x00]).await?;
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await?;
+            assert_eq!(greeting, [0x05, 0x00]);
+            client.write_all(&request).await?;
+            assert_eq!(server_task.await??, expected);
+        }
+
+        let (mut client, mut server) = tcp_stream_pair().await?;
+        let server_task =
+            tokio::spawn(async move { read_socks5_connect_target(&mut server).await });
+        client.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0_u8; 2];
+        client.read_exact(&mut greeting).await?;
+        assert_eq!(greeting, [0x05, 0x00]);
+        client.write_all(&[0x05, 0x02, 0x00, 0x01]).await?;
+        let mut failure = [0_u8; 10];
+        client.read_exact(&mut failure).await?;
+        assert_eq!(failure, [0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            server_task.await?,
+            Err(ClientError::UnsupportedSocks5Command(0x02))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn socks5_request_parser_rejects_nonzero_reserved_byte_and_unknown_address_type()
+    -> Result<(), ClientError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (request, reply) in [
+            (b"\x05\x01\x01\x01".as_slice(), 0x01),
+            (b"\x05\x01\x00\xff".as_slice(), 0x08),
+        ] {
+            let (mut client, mut server) = tcp_stream_pair().await?;
+            let server_task =
+                tokio::spawn(async move { read_socks5_connect_target(&mut server).await });
+            client.write_all(&[0x05, 0x01, 0x00]).await?;
+            let mut greeting = [0_u8; 2];
+            client.read_exact(&mut greeting).await?;
+            assert_eq!(greeting, [0x05, 0x00]);
+            client.write_all(request).await?;
+            let mut failure = [0_u8; 10];
+            client.read_exact(&mut failure).await?;
+            assert_eq!(failure, [0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            assert!(matches!(
+                server_task.await?,
+                Err(ClientError::InvalidSocks5Request)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn socks5_udp_datagram_parser_covers_domains_ipv6_and_malformed_frames() {
+        let mut domain = b"\x00\x00\x00\x03\x09localhost\x00\x35payload".to_vec();
+        let decoded = decode_socks5_udp_datagram(&domain).expect("decode domain SOCKS5 datagram");
+        assert_eq!(
+            decoded.target,
+            Socks5UdpTarget::Domain {
+                domain: "localhost".to_owned(),
+                port: 53
+            }
+        );
+        assert_eq!(decoded.payload, b"payload");
+
+        let address: Ipv6Addr = "2001:db8::1"
+            .parse()
+            .expect("parse IPv6 SOCKS5 datagram target");
+        let mut ipv6 = vec![0, 0, 0, 4];
+        ipv6.extend_from_slice(&address.octets());
+        ipv6.extend_from_slice(&443_u16.to_be_bytes());
+        ipv6.extend_from_slice(b"v6");
+        let decoded = decode_socks5_udp_datagram(&ipv6).expect("decode IPv6 SOCKS5 datagram");
+        assert_eq!(
+            decoded.target,
+            Socks5UdpTarget::Ip(SocketAddr::new(IpAddr::V6(address), 443))
+        );
+        assert_eq!(decoded.payload, b"v6");
+
+        for malformed in [
+            vec![],
+            vec![0, 0, 1, 1, 127, 0, 0, 1, 0, 53],
+            vec![0, 0, 0, 1, 127],
+            vec![0, 0, 0, 3, 0, 0, 53],
+            vec![0, 0, 0, 3, 1, 0xff, 0, 53],
+            vec![0, 0, 0, 4, 0],
+            vec![0, 0, 0, 0xff],
+        ] {
+            assert!(
+                matches!(
+                    decode_socks5_udp_datagram(&malformed),
+                    Err(ClientError::InvalidSocks5Request)
+                ),
+                "malformed datagram unexpectedly accepted: {malformed:?}"
+            );
+        }
+        domain.clear();
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_routes_are_sticky_and_isolated_by_source_peer() {
+        let peer_a: SocketAddr = "127.0.0.1:10001"
+            .parse()
+            .expect("parse first SOCKS5 UDP peer");
+        let peer_b: SocketAddr = "127.0.0.1:10002"
+            .parse()
+            .expect("parse second SOCKS5 UDP peer");
+        let foreign_peer: SocketAddr = "127.0.0.2:10003"
+            .parse()
+            .expect("parse foreign SOCKS5 UDP peer");
+        let (route_a, mut received_a) = tokio::sync::mpsc::channel(2);
+        let (route_b, mut received_b) = tokio::sync::mpsc::channel(2);
+        let mut pending = VecDeque::from([
+            PendingSocks5UdpRelay {
+                control_ip: peer_a.ip(),
+                requested_endpoint: Socks5UdpClientEndpoint {
+                    ip: Some(peer_a.ip()),
+                    port: peer_a.port(),
+                },
+                route: route_a,
+            },
+            PendingSocks5UdpRelay {
+                control_ip: peer_b.ip(),
+                requested_endpoint: Socks5UdpClientEndpoint {
+                    ip: Some(peer_b.ip()),
+                    port: peer_b.port(),
+                },
+                route: route_b,
+            },
+        ]);
+        let mut routes = HashMap::new();
+
+        route_mixed_socks5_udp_datagram(foreign_peer, vec![0], &mut pending, &mut routes).await;
+        route_mixed_socks5_udp_datagram(peer_a, vec![1], &mut pending, &mut routes).await;
+        route_mixed_socks5_udp_datagram(peer_b, vec![2], &mut pending, &mut routes).await;
+        route_mixed_socks5_udp_datagram(peer_a, vec![3], &mut pending, &mut routes).await;
+
+        let first_a = received_a.recv().await.expect("peer A first datagram");
+        let second_a = received_a.recv().await.expect("peer A second datagram");
+        let first_b = received_b.recv().await.expect("peer B datagram");
+        assert_eq!((first_a.udp_peer, first_a.datagram), (peer_a, vec![1]));
+        assert_eq!((second_a.udp_peer, second_a.datagram), (peer_a, vec![3]));
+        assert_eq!((first_b.udp_peer, first_b.datagram), (peer_b, vec![2]));
+        assert!(pending.is_empty());
+        assert_eq!(routes.len(), 2);
+    }
+
     struct ReadAheadReader {
         payload: Vec<u8>,
         offset: usize,
@@ -2059,6 +2370,28 @@ mod tests {
             tls: zuicity_transport::TlsPolicy::upstream(),
             streams: zuicity_transport::StreamPolicy::upstream(),
         })
+    }
+
+    #[test]
+    fn client_runtime_maps_configured_congestion_controller_into_dialer_policy()
+    -> Result<(), zuicity_config::ConfigError> {
+        for (value, expected) in [
+            (Some("bbr"), CongestionController::Bbr),
+            (Some("cubic"), CongestionController::Cubic),
+            (Some("new_reno"), CongestionController::NewReno),
+            (None, CongestionController::Bbr),
+            (Some("unknown"), CongestionController::Bbr),
+        ] {
+            let field = value.map_or_else(String::new, |value| {
+                format!(r#", "congestion_control": "{value}""#)
+            });
+            let runtime = ClientRuntime::new(client_config(&format!(
+                r#"{{"server":"127.0.0.1:9443","uuid":"00000000-0000-0000-0000-000000000001","password":"password"{field}}}"#,
+            ))?);
+            let params = runtime.quic_dialer_params(&[]);
+            assert_eq!(params.policy.congestion_controller, expected);
+        }
+        Ok(())
     }
 
     fn server_config(

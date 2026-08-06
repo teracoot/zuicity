@@ -32,6 +32,11 @@ UDP_SEGMENT_CMSG_PATTERN = re.compile(
     r"cmsg_type=(?:UDP_SEGMENT|0x0*67|103)\b",
     re.IGNORECASE,
 )
+UDP_SEGMENT_SETSOCKOPT_PATTERN = re.compile(
+    r"\bsetsockopt\([^,]+,\s*(?:SOL_UDP|IPPROTO_UDP|0x0*11|17),\s*"
+    r"(?:UDP_SEGMENT|0x0*67|103)\b",
+    re.IGNORECASE,
+)
 SUCCESSFUL_SYSCALL_PATTERN = re.compile(r"\)\s+=\s+[1-9][0-9]*(?:\s.*)?$")
 MODES = ("on", "off")
 CONTROLLED_ENV = {
@@ -117,18 +122,27 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def count_udp_segment_traces(trace_paths: Iterable[pathlib.Path]) -> tuple[int, int]:
-    attempts = 0
+def count_udp_segment_traces(trace_paths: Iterable[pathlib.Path]) -> tuple[int, int, int]:
+    data_attempts = 0
     successes = 0
+    capability_probes = 0
     for path in trace_paths:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
-                if not UDP_SEGMENT_CMSG_PATTERN.search(line):
+                data_send = UDP_SEGMENT_CMSG_PATTERN.search(line)
+                capability_probe = UDP_SEGMENT_SETSOCKOPT_PATTERN.search(line)
+                if not data_send and not capability_probe:
                     continue
-                attempts += 1
-                if SUCCESSFUL_SYSCALL_PATTERN.search(line):
+                if data_send:
+                    data_attempts += 1
+                if capability_probe:
+                    capability_probes += 1
+                # A successful setsockopt proves a capability probe, not that a
+                # segmented data message was sent. Preserve the suite's
+                # GSO-present gate by counting only successful sendmsg cmsgs.
+                if data_send and SUCCESSFUL_SYSCALL_PATTERN.search(line):
                     successes += 1
-    return attempts, successes
+    return data_attempts, successes, capability_probes
 
 
 def resolve_binary_path(
@@ -1394,10 +1408,10 @@ def main() -> int:
             else:
                 print(json.dumps(summary, indent=2, sort_keys=True))
         elif args.command == "trace-counts":
-            attempts, successes = count_udp_segment_traces(
+            attempts, successes, capability_probes = count_udp_segment_traces(
                 pathlib.Path(path) for path in args.traces
             )
-            print(attempts, successes)
+            print(attempts, successes, capability_probes)
         else:
             output = run_campaign(args)
             print(f"CAMPAIGN_COMPLETE {output}")

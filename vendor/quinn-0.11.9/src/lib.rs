@@ -45,6 +45,10 @@ use std::sync::Arc;
 
 mod connection;
 mod endpoint;
+#[cfg(target_os = "linux")]
+mod gso;
+#[cfg(target_os = "linux")]
+mod gro;
 mod incoming;
 mod mutex;
 mod recv_stream;
@@ -79,6 +83,10 @@ pub use crate::connection::{
     SendDatagramError, ZeroRttAccepted,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
+#[cfg(target_os = "linux")]
+pub use crate::gso::send_udp_gso;
+#[cfg(target_os = "linux")]
+pub use crate::gro::GroSocketState;
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
 #[cfg(feature = "runtime-async-std")]

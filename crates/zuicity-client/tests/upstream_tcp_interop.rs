@@ -15,7 +15,7 @@ use tokio::{
 use zuicity_client::{ClientRuntime, ClientRuntimeConfig};
 use zuicity_config::{load_json_str, validate_client};
 use zuicity_testkit::{
-    ManagedProcessBuilder, TcpEchoServer, UdpEchoServer, UpstreamBinaries, artifact_dir,
+    ManagedProcessBuilder, TcpEchoServer, UdpEchoServer, UpstreamBinaries, artifact_dir, json_path,
     reserve_udp_socket, write_self_signed_cert_fixture,
 };
 use zuicity_transport::{StreamPolicy, TlsPolicy};
@@ -86,8 +86,8 @@ async fn rust_client_forwarder_reaches_upstream_server_tcp_echo_with_real_auth()
         &server_config_path,
         format!(
             r#"{{"listen":"{upstream_addr}","users":{{"{uuid}":"{password}"}},"certificate":"{}","private_key":"{}"}}"#,
-            cert.cert_path.display(),
-            cert.key_path.display()
+            json_path(&cert.cert_path),
+            json_path(&cert.key_path)
         ),
     )?;
 
@@ -195,8 +195,8 @@ async fn rust_client_udp_forwarder_reaches_upstream_server_udp_echo_with_real_au
         &server_config_path,
         format!(
             r#"{{"listen":"{upstream_addr}","users":{{"{uuid}":"{password}"}},"certificate":"{}","private_key":"{}"}}"#,
-            cert.cert_path.display(),
-            cert.key_path.display()
+            json_path(&cert.cert_path),
+            json_path(&cert.key_path)
         ),
     )?;
 

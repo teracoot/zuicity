@@ -1109,8 +1109,8 @@ async fn run_upstream_tcp_latency(iterations: usize) -> anyhow::Result<LatencyRu
         &server_config_path,
         format!(
             r#"{{"listen":"{server_addr}","users":{{"{uuid}":"{password}"}},"certificate":"{}","private_key":"{}","log_level":"debug"}}"#,
-            cert.cert_path.display(),
-            cert.key_path.display()
+            zuicity_testkit::json_path(&cert.cert_path),
+            zuicity_testkit::json_path(&cert.key_path)
         ),
     )
     .context("write upstream comparative server config")?;
@@ -1172,16 +1172,21 @@ async fn run_upstream_tcp_latency(iterations: usize) -> anyhow::Result<LatencyRu
     echo_shutdown?;
     let client_exit = client_exit?;
     let server_exit = server_exit?;
-    ensure!(
-        !client_exit.forced,
-        "upstream comparative client required SIGKILL; log={}",
-        client_log_path.display()
-    );
-    ensure!(
-        !server_exit.forced,
-        "upstream comparative server required SIGKILL; log={}",
-        server_log_path.display()
-    );
+    #[cfg(unix)]
+    {
+        ensure!(
+            !client_exit.forced,
+            "upstream comparative client required SIGKILL; log={}",
+            client_log_path.display()
+        );
+        ensure!(
+            !server_exit.forced,
+            "upstream comparative server required SIGKILL; log={}",
+            server_log_path.display()
+        );
+    }
+    #[cfg(windows)]
+    let _ = (client_exit, server_exit, client_log_path, server_log_path);
 
     result
 }
@@ -1225,8 +1230,8 @@ async fn run_upstream_udp_latency(iterations: usize) -> anyhow::Result<LatencyRu
         &server_config_path,
         format!(
             r#"{{"listen":"{server_addr}","users":{{"{uuid}":"{password}"}},"certificate":"{}","private_key":"{}","log_level":"debug"}}"#,
-            cert.cert_path.display(),
-            cert.key_path.display()
+            zuicity_testkit::json_path(&cert.cert_path),
+            zuicity_testkit::json_path(&cert.key_path)
         ),
     )
     .context("write upstream comparative UDP server config")?;
@@ -1288,16 +1293,21 @@ async fn run_upstream_udp_latency(iterations: usize) -> anyhow::Result<LatencyRu
     echo_shutdown?;
     let client_exit = client_exit?;
     let server_exit = server_exit?;
-    ensure!(
-        !client_exit.forced,
-        "upstream comparative UDP client required SIGKILL; log={}",
-        client_log_path.display()
-    );
-    ensure!(
-        !server_exit.forced,
-        "upstream comparative UDP server required SIGKILL; log={}",
-        server_log_path.display()
-    );
+    #[cfg(unix)]
+    {
+        ensure!(
+            !client_exit.forced,
+            "upstream comparative UDP client required SIGKILL; log={}",
+            client_log_path.display()
+        );
+        ensure!(
+            !server_exit.forced,
+            "upstream comparative UDP server required SIGKILL; log={}",
+            server_log_path.display()
+        );
+    }
+    #[cfg(windows)]
+    let _ = (client_exit, server_exit, client_log_path, server_log_path);
 
     result
 }

@@ -67,6 +67,11 @@ case "$TRACE_GSO" in
   present|absent|skip) ;;
   *) echo "--trace-gso must be present, absent, or skip" >&2; exit 2 ;;
 esac
+ZUICITY_CONGESTION_CONTROL=${BENCH_ZUICITY_CONGESTION_CONTROL:-bbr}
+case "$ZUICITY_CONGESTION_CONTROL" in
+  bbr|cubic|new_reno) ;;
+  *) echo "BENCH_ZUICITY_CONGESTION_CONTROL must be bbr, cubic, or new_reno" >&2; exit 2 ;;
+esac
 if [[ $(id -u) -ne 0 ]]; then
   echo "bench-one-tcp.sh must run as root" >&2
   exit 1
@@ -88,7 +93,8 @@ for preload in "${BENCH_CLIENT_PRELOAD:-}" "${BENCH_SERVER_PRELOAD:-}"; do
     exit 2
   }
 done
-[[ -f "$HERE/tcp-driver.py" && -f "$HERE/echo-server.py" ]] || {
+TCP_DRIVER=${BENCH_TCP_DRIVER:-$HERE/tcp-driver.py}
+[[ -f "$TCP_DRIVER" && -f "$HERE/echo-server.py" ]] || {
   echo "benchmark helper is missing" >&2
   exit 2
 }
@@ -145,6 +151,7 @@ SERVER_PORT=9443
 TARGET_PORT=7000
 UDP_TARGET_PORT=7001
 FORWARD_PORT=1080
+LOG_LEVEL=${BENCH_LOG_LEVEL:-warn}
 SERVER_PID=""
 CLIENT_PID=""
 
@@ -160,7 +167,7 @@ cleanup() {
     ip netns del "$namespace" 2>/dev/null || true
   done
   ip link del "$VETH_SERVER" 2>/dev/null || true
-  for file in echo.log server.log client.log driver.stderr result.json resources.json merged.json; do
+  for file in echo.log server.log client.log driver.stderr result.json resources.json merged.json server.json client.json; do
     if [[ -f "$WORK/$file" ]]; then
       install -m 0644 "$WORK/$file" "$CAPTURE_DIR/$file"
     fi
@@ -201,10 +208,10 @@ openssl req -x509 -newkey rsa:2048 \
   -subj /CN=zuicity.local \
   -addext "subjectAltName=DNS:zuicity.local,IP:$IP_SERVER" >/dev/null 2>&1
 cat >"$WORK/server.json" <<JSON
-{"listen":"$IP_SERVER:$SERVER_PORT","users":{"00000000-0000-0000-0000-000000000099":"bench-password"},"certificate":"$WORK/cert.pem","private_key":"$WORK/key.pem","congestion_control":"bbr","log_level":"warn"}
+{"listen":"$IP_SERVER:$SERVER_PORT","users":{"00000000-0000-0000-0000-000000000099":"bench-password"},"certificate":"$WORK/cert.pem","private_key":"$WORK/key.pem","congestion_control":"$ZUICITY_CONGESTION_CONTROL","log_level":"$LOG_LEVEL"}
 JSON
 cat >"$WORK/client.json" <<JSON
-{"server":"$IP_SERVER:$SERVER_PORT","uuid":"00000000-0000-0000-0000-000000000099","password":"bench-password","sni":"zuicity.local","allow_insecure":true,"congestion_control":"bbr","log_level":"warn","forward":{"$IP_CLIENT:$FORWARD_PORT/tcp":"$IP_SERVER:$TARGET_PORT"}}
+{"server":"$IP_SERVER:$SERVER_PORT","uuid":"00000000-0000-0000-0000-000000000099","password":"bench-password","sni":"zuicity.local","allow_insecure":true,"congestion_control":"$ZUICITY_CONGESTION_CONTROL","log_level":"$LOG_LEVEL","forward":{"$IP_CLIENT:$FORWARD_PORT/tcp":"$IP_SERVER:$TARGET_PORT"}}
 JSON
 
 ip netns exec "$NS_SERVER" "${ECHO_AFFINITY[@]}" \
@@ -222,9 +229,9 @@ if [[ -n "${BENCH_CLIENT_PRELOAD:-}" ]]; then
   CLIENT_COMMAND=(env LD_PRELOAD="$BENCH_CLIENT_PRELOAD" "${CLIENT_COMMAND[@]}")
 fi
 if [[ "$TRACE_GSO" != skip ]]; then
-  SERVER_COMMAND=(strace -ff -qq -s 1 -e trace=sendmsg,sendmmsg \
+  SERVER_COMMAND=(strace -ff -qq -s 1 -e trace=setsockopt,sendmsg,sendmmsg \
     -o "$WORK/server.strace" "${SERVER_COMMAND[@]}")
-  CLIENT_COMMAND=(strace -ff -qq -s 1 -e trace=sendmsg,sendmmsg \
+  CLIENT_COMMAND=(strace -ff -qq -s 1 -e trace=setsockopt,sendmsg,sendmmsg \
     -o "$WORK/client.strace" "${CLIENT_COMMAND[@]}")
 fi
 
@@ -249,7 +256,7 @@ SERVER_TICKS_BEFORE=$(cpu_ticks "$SERVER_PID")
 CLIENT_TICKS_BEFORE=$(cpu_ticks "$CLIENT_PID")
 
 ip netns exec "$NS_CLIENT" "${DRIVER_AFFINITY[@]}" \
-  python3 "$HERE/tcp-driver.py" \
+  python3 "$TCP_DRIVER" \
     --client-ip "$IP_CLIENT" \
     --forward-port "$FORWARD_PORT" \
     --tag "$TAG" \
@@ -282,17 +289,21 @@ CLK_TCK=$(getconf CLK_TCK)
 
 UDP_SEGMENT_ATTEMPTS=0
 UDP_SEGMENT_SUCCESSES=0
+UDP_SEGMENT_CAPABILITY_PROBES=0
 TRACE_PASSED=true
 if [[ "$TRACE_GSO" != skip ]]; then
   shopt -s nullglob
   TRACE_FILES=("$WORK"/*.strace*)
   if (( ${#TRACE_FILES[@]} > 0 )); then
     TRACE_COUNTS=$(python3 "$HERE/tcp_gso_suite.py" trace-counts "${TRACE_FILES[@]}")
-    read -r UDP_SEGMENT_ATTEMPTS UDP_SEGMENT_SUCCESSES <<<"$TRACE_COUNTS"
+    read -r UDP_SEGMENT_ATTEMPTS UDP_SEGMENT_SUCCESSES UDP_SEGMENT_CAPABILITY_PROBES <<<"$TRACE_COUNTS"
   fi
   if [[ "$TRACE_GSO" == present && "$UDP_SEGMENT_SUCCESSES" -eq 0 ]]; then
     TRACE_PASSED=false
   elif [[ "$TRACE_GSO" == absent && "$UDP_SEGMENT_ATTEMPTS" -ne 0 ]]; then
+    TRACE_PASSED=false
+  fi
+  if [[ "$UDP_SEGMENT_CAPABILITY_PROBES" -ne 0 ]]; then
     TRACE_PASSED=false
   fi
 fi
@@ -304,6 +315,7 @@ python3 - \
   "$CLIENT_BASELINE" "$CLIENT_PEAK" "$CLIENT_HWM" "$CLIENT_POST" \
   "$CLIENT_TICKS_BEFORE" "$CLIENT_TICKS_AFTER" \
   "$TRACE_GSO" "$UDP_SEGMENT_ATTEMPTS" "$UDP_SEGMENT_SUCCESSES" \
+  "$UDP_SEGMENT_CAPABILITY_PROBES" \
   "$TRACE_PASSED" "$CPUS" "$SERVER_CPUS" "$CLIENT_CPUS" "$DRIVER_CPUS" \
   "$ECHO_CPUS" <<'PY'
 import json
@@ -330,6 +342,7 @@ import sys
     trace_expected,
     udp_segment_attempts,
     udp_segment_successes,
+    udp_segment_capability_probes,
     trace_passed,
     cpus,
     server_cpus,
@@ -406,6 +419,7 @@ result["gso_trace"] = {
     "expected": trace_expected,
     "udp_segment_attempts": int(udp_segment_attempts),
     "udp_segment_successes": int(udp_segment_successes),
+    "udp_segment_capability_probes": int(udp_segment_capability_probes),
     "passed": trace_passed == "true",
 }
 pathlib.Path(result_path).write_text(

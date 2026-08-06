@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    udp_plain_direct,
+    GroMode, GsoMode, PlainUdpSocket, PlainUdpTestConfig, udp_plain_direct,
     udp_plain_syscall::PlainBatchIo,
     udp_plain_test_support::{PlainSendTestHook, ScriptedAttempt, ScriptedPoll},
     udp_state::PlainSendCounters,
@@ -169,5 +169,38 @@ async fn given_recovery_eagain_when_socket_is_writable_then_only_suffix_is_retri
         ]
     );
     assert_eq!(counters.sendmmsg_datagrams.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_transient_udp_send_error_when_quinn_sends_then_packet_loss_is_not_fatal()
+-> io::Result<()> {
+    let hook =
+        PlainSendTestHook::scripted([ScriptedAttempt::Accepted(1), ScriptedAttempt::WouldBlock])
+            .with_polls([ScriptedPoll::TimedOut]);
+    let receiver = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let sender = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let mut config = PlainUdpTestConfig::new(GsoMode::Off, GroMode::Off);
+    config.plain_hook = Some(hook);
+    let socket = PlainUdpSocket::with_test_config(sender, config)?;
+
+    quinn::AsyncUdpSocket::try_send(&socket, &transmit(receiver.local_addr()?, b"aaaabbbb"))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn given_zero_progress_would_block_when_quinn_sends_then_writability_is_requested()
+-> io::Result<()> {
+    let hook = PlainSendTestHook::scripted([ScriptedAttempt::WouldBlock]);
+    let receiver = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let sender = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let mut config = PlainUdpTestConfig::new(GsoMode::Off, GroMode::Off);
+    config.plain_hook = Some(hook);
+    let socket = PlainUdpSocket::with_test_config(sender, config)?;
+
+    let error =
+        quinn::AsyncUdpSocket::try_send(&socket, &transmit(receiver.local_addr()?, b"aaaabbbb"))
+            .expect_err("WouldBlock must remain visible to Quinn");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     Ok(())
 }

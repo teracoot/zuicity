@@ -32,6 +32,8 @@ not match.
   summarizes accepted rotation rows.
 - `run-comparison.sh` is the canonical wrapper for `tcp_gso_suite.py run`.
 - `bench-one-tcp.sh` is the internal namespace and process-accounting harness.
+  `BENCH_ZUICITY_CONGESTION_CONTROL` may select `bbr`, `cubic`, or `new_reno`
+  for both generated Zuicity endpoint configs; it defaults to `bbr`.
 - `tcp-driver.py` generates fresh-connect RTT, persistent RTT, and TCP echo
   throughput samples with `TCP_NODELAY`.
 - `echo-server.py` provides the isolated target service.
@@ -59,6 +61,18 @@ evidence.
 
 The suite checks for stale `zuicity-bench-*` namespaces and fails closed rather
 than deleting unexplained state.
+
+Direct `bench-one-tcp.sh` runs use BBR by default. Preserve the captured
+`client.json` and `server.json` files as evidence:
+
+```bash
+sudo scripts/benchmark/bench-one-tcp.sh <row arguments>
+```
+
+`BENCH_ZUICITY_CONGESTION_CONTROL` exists for explicit controller experiments;
+it does not change the BBR default. The setting affects only Zuicity JSON
+generation. Comparator wrappers may ignore those generated files and apply
+their own pinned congestion profile.
 
 ## Prepare and validate
 
@@ -117,8 +131,8 @@ standard or release protocol.
 ## GSO verification
 
 Before measured rows, the suite runs one traced probe for every implementation
-and mode. The probes use `strace` on `sendmsg`/`sendmmsg`; measured rows are not
-traced.
+and mode. The probes use `strace` on `setsockopt`, `sendmsg`, and `sendmmsg`;
+measured rows are not traced.
 
 Probe traffic is deliberately small and is not a workload qualification. A mode
 may explicitly accept a driver error after the required syscall evidence is
@@ -126,10 +140,13 @@ captured; this is used for latest `juicity-rs`, whose packet path becomes
 pathologically slow under `strace`. Its untraced workload must still pass the
 full measured-row contract, and any failure is retained and retried normally.
 
-- GSO-on requires at least one successful `UDP_SEGMENT` send.
-- GSO-off requires zero `UDP_SEGMENT` attempts.
-- The parser recognizes both symbolic `UDP_SEGMENT` and the Linux numeric control
-  message type `0x67`/`103` under `SOL_UDP` or `IPPROTO_UDP`.
+- GSO-on requires at least one successful `UDP_SEGMENT` data send.
+- GSO-off requires zero `UDP_SEGMENT` data-send attempts.
+- Every mode requires zero `UDP_SEGMENT` capability probes or persistent
+  socket-option writes.
+- The parser recognizes symbolic and numeric (`0x67`/`103`) forms in both
+  `setsockopt` probes and send control messages under `SOL_UDP` or
+  `IPPROTO_UDP`.
 - Any failed probe, driver error, hash mismatch, or malformed result stops the
   campaign.
 
@@ -140,6 +157,9 @@ The pinned controls are:
 | Rust | `ZUICITY_ENABLE_GSO=1`; unset `ZUICITY_DISABLE_GSO` | `ZUICITY_DISABLE_GSO=1`; unset `ZUICITY_ENABLE_GSO` |
 | Go | `QUIC_GO_DISABLE_GSO=` | `QUIC_GO_DISABLE_GSO=true` |
 | `juicity-rs` | Unmodified Quinn default | Unmodified release binary plus hash-pinned external `UDP_SEGMENT` capability denial |
+
+Zuicity remains GSO-off unless explicitly enabled. `ZUICITY_DISABLE_GSO` takes
+precedence if both variables are set.
 
 ## Statistical contract
 

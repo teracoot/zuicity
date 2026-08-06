@@ -65,6 +65,9 @@ udp = { package = "quinn-udp", path = "../quinn-udp", version = "0.5", default-f
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 socket2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 web-time = { workspace = true }
 

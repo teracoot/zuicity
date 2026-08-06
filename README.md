@@ -14,11 +14,12 @@ built upon and highly inspired by the upstream
 
 It re-implements the juicity protocol on top of [quinn](https://github.com/quinn-rs/quinn)
 and [tokio](https://github.com/tokio-rs/tokio), keeping byte-for-byte wire and
-authentication compatibility with the upstream Go server and client. In the
-latest matched local-veth campaign, v0.4.0 delivered 1.77x stock Go throughput
-with 56% less combined peak process memory. The port is validated not only on a
-local test bench but over real cross-host network paths and against a live,
-public Go juicity server on the Internet.
+authentication compatibility with the upstream Go server and client. The active
+candidate keeps upstream-compatible BBR as its default congestion controller,
+uses ordinary UDP datagrams by default, and supports explicit opt-in Linux UDP
+GSO. The port is validated not only on a local test bench but over real
+cross-host network paths and against a live, public Go juicity server on the
+Internet.
 
 As a drop-in replacement for the upstream client and server, zuicity speaks
 the same `run -c <config.json>` interface and the same config schema, so existing
@@ -26,20 +27,59 @@ juicity deployments interoperate with it unchanged.
 
 ## Highlights
 
-- **Faster.** In the matched GSO-on campaign, v0.4.0 reached 1278.97 Mbps:
-  74.03% higher paired throughput than stock Go v0.5.0 and 19.69% higher than
-  repaired full-GSO Go v0.5.0.
-- **Leaner.** Combined peak process memory was 16,974 KiB versus 38,464 KiB for
-  stock Go in the matched campaign. On a historical real-WAN server, zuicity
-  used ~13 MB versus ~37 MB for Go, with no observed leak.
-- **Reliable.** Release builds keep UDP GSO opt-in for path safety on hostile
-  egresses (veth, tun/VPN, virtio, many cloud NICs), while GRO remains
-  receive-only and wire-invisible; the cross-host suite passes over IPv4, IPv6,
-  and a 6-scenario comprehensive matrix.
+- **BBR by default.** Client, server, DAE, and nested QUIC outbound paths install
+  the configured Quinn controller. Empty and unknown values select BBR, and the
+  installed example configurations explicitly use `congestion_control=bbr`.
+- **Faster under matched treatments.** With BBR on both products, Zuicity won
+  all five throughput pairs against Hysteria2 with GSO off/off and all five with
+  GSO on/on.
+- **Leaner.** On a historical real-WAN server, zuicity used ~13 MB versus
+  ~37 MB for Go, with no observed leak.
+- **Reliable.** GSO is off by default and opt-in on Linux. It uses only a
+  per-message `UDP_SEGMENT` cmsg, never a capability probe or persistent socket
+  option, and falls back per destination on GSO-hostile paths.
 - **Compatible.** Verified live against a real upstream Go juicity **v0.5.0**
   server over the public Internet, including full system-root TLS validation.
 
 ## Benchmarks
+
+### Current BBR candidate
+
+The active candidate uses BBR on both Zuicity endpoints. The matched Oracle
+campaign compares it with official Hysteria2 v2.11.0 using the same BBR profile
+and same GSO treatment in each pair: off versus off and on versus on. Every row
+used 60 fresh-connect RTT samples, 60 persistent RTT samples, 100
+send-plus-full-echo transfers of 4 MiB, and five warmups. Server and echo were
+pinned to CPU 0; client and driver were pinned to CPU 1.
+
+| GSO | Implementation | Throughput (Mbps) | Proxy CPU (s) | Pair wins |
+|---|---|---:|---:|---:|
+| off | **Zuicity BBR** | **86.44** | **52.27** | **5/5** |
+| off | Hysteria2 BBR | 80.12 | 61.57 | 0/5 |
+| on | **Zuicity BBR** | **179.94** | **18.52** | **5/5** |
+| on | Hysteria2 BBR | 107.21 | 41.97 | 0/5 |
+
+Zuicity's median throughput advantage was 7.88% off/off and 67.84% on/on. The
+four pre-campaign syscall probes proved zero `UDP_SEGMENT` data sends in both
+off arms, successful segmented sends in both on arms, and zero `UDP_SEGMENT`
+capability probes in every arm. The frozen candidate hashes are
+`a63adaff2ec2852516ac8664bbe3b20f440234682452d0a7134d0a2a7beda11d`
+(client) and
+`5c1b1c2701c45cf84effe9e75b904cc249bf44789475735cecfd76f3cc039b6a`
+(server).
+
+`congestion_control` is local to each QUIC sender. `bbr`, `cubic`, and
+`new_reno` are wired to Quinn, but BBR is the selected candidate and the
+upstream-compatible fallback.
+
+### Experimental CUBIC comparison
+
+An explicit CUBIC A/B reached 110.69 Mbps versus Hysteria2 at 107.82 Mbps and
+won all five pairs. This result is retained as investigation evidence only.
+CUBIC is not the selected candidate, is not the default, and is not required by
+the release profile.
+
+### Historical four-product GSO campaign
 
 This matched campaign used two fresh Linux network namespaces joined by a
 `veth` pair, real kernel IP and QUIC stacks, and one complete eight-treatment
@@ -119,8 +159,9 @@ A/B-tested and gated on cross-host correctness:
 - A shared, reused QUIC connection across forwarded and mixed SOCKS5/HTTP
   streams (mirroring the Go dialer), collapsing the per-connection handshake cost
   - the change that closes the fresh-connect latency gap on real WAN paths.
-- BBR congestion control wired into the QUIC transport, matching upstream's
-  `congestion_control=bbr` instead of silently falling back to CUBIC.
+- Configured BBR, CUBIC, or NewReno wired end-to-end into the actual Quinn
+  controller factory. BBR remains the default, compatibility fallback, and
+  selected release-candidate profile.
 - Concurrent per-stream relay on the server (Go's goroutine-per-stream model).
 - 64 KiB relay buffers and `TCP_NODELAY` on local and target sockets.
 - Optional adaptive Linux UDP GSO on send and GRO on receive.
@@ -146,16 +187,18 @@ size:
 
 ## Reliability
 
-- **Adaptive GSO/GRO with fallback.** UDP segmentation offload is off by default
-  for release safety. `ZUICITY_ENABLE_GSO=1` opts in on Linux, and eligible
-  post-handshake bulk packets fall back, in the same send call, to plain
-  datagrams on `EINVAL`/`EIO`, per destination. QUIC handshake packets are never
-  segmented, so the handshake always completes even on GSO-hostile paths.
+- **Safe GSO default and fallback.** Without an explicit opt-in, Linux sends
+  grouped traffic as ordinary datagrams through safe `sendmmsg`.
+  `ZUICITY_ENABLE_GSO=1` enables per-message GSO for eligible short-header
+  groups; `ZUICITY_DISABLE_GSO=1` takes precedence. `EINVAL`/`EIO` disables GSO
+  only for that destination and immediately retries the untouched group as
+  ordinary datagrams. Handshake long-header packets are never segmented.
+- **Receive-only GRO.** `UDP_GRO` remains enabled when supported and falls back
+  to plain receives when unavailable.
 - **Connection-loss handling.** A peer that disappears is treated as a clean
   connection close rather than a hard error.
-- **Cross-host validation.** The two-namespace runtime, 6-scenario
-  comprehensive, and IPv6 suites pass with default-safe send behavior and with
-  opt-in GSO/GRO engaged.
+- **Cross-host validation.** The matched off/off and on/on BBR treatments pass
+  syscall proof and full-size forwarding workloads.
 
 ## Compatibility
 

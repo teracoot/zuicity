@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 
 use crate::{PlainUdpSocket, TransportError};
 
-/// Builds a quinn endpoint bound to `addr` using the adaptive
-/// [`PlainUdpSocket`]: no GRO/ECN/PMTUDISC on the receive path, optional
-/// per-message UDP GSO on send (per [`crate::GsoMode::from_env`]). With
-/// `Some(server_config)` it is a server endpoint, otherwise a client endpoint.
+/// Builds a Quinn endpoint bound to `addr` using [`PlainUdpSocket`]. Linux may
+/// use receive-only GRO; sends remain ordinary datagrams unless UDP GSO is
+/// explicitly enabled. With `Some(server_config)` it is a server endpoint,
+/// otherwise a client endpoint.
 pub(super) fn build_ecn_safe_endpoint(
     addr: SocketAddr,
     server_config: Option<quinn::ServerConfig>,
@@ -14,7 +14,7 @@ pub(super) fn build_ecn_safe_endpoint(
     build_ecn_safe_endpoint_from_socket(socket, server_config)
 }
 
-/// Wraps an already-bound std UDP socket into an adaptive-GSO quinn endpoint.
+/// Wraps an already-bound UDP socket into a Quinn endpoint with GSO off by default.
 pub(super) fn build_ecn_safe_endpoint_from_socket(
     socket: std::net::UdpSocket,
     server_config: Option<quinn::ServerConfig>,

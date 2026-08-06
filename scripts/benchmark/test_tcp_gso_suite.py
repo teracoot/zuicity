@@ -175,13 +175,18 @@ class TraceTests(unittest.TestCase):
             "cmsg_type=103, cmsg_data=[1400]}]}, 0) = -1 EIO (Input/output error)",
             "sendmsg(3, {msg_control=[{cmsg_level=SOL_IP, "
             "cmsg_type=0x67, cmsg_data=[1400]}]}, 0) = 1400",
+            "setsockopt(9, SOL_UDP, UDP_SEGMENT, [1500], 4) = 0",
+            "setsockopt(9, IPPROTO_UDP, 103, [1500], 4) = -1 EINVAL (Invalid argument)",
+            "setsockopt(9, 17, 0x67, [1500], 4) = 0",
+            "setsockopt(9, SOL_IP, UDP_SEGMENT, [1500], 4) = 0",
         ]
         with tempfile.TemporaryDirectory() as raw_directory:
             trace = pathlib.Path(raw_directory) / "client.strace.1"
             trace.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            attempts, successes = suite.count_udp_segment_traces([trace])
+            attempts, successes, capability_probes = suite.count_udp_segment_traces([trace])
         self.assertEqual(attempts, 3)
         self.assertEqual(successes, 2)
+        self.assertEqual(capability_probes, 3)
 
 
 class SummaryTests(unittest.TestCase):

@@ -8,6 +8,55 @@ comprehensive, IPv6) stayed green and the full workspace tests stayed green.
 
 ## Headline Result
 
+### Current BBR candidate
+
+The active Oracle-host candidate uses BBR on both client and server, ordinary
+datagrams by default, explicit opt-in Linux UDP GSO, and receive-only GRO. The
+comparator is official Hysteria2 v2.11.0 with its standard BBR profile. Each
+comparison matches the GSO treatment: off versus off and on versus on.
+
+The standard campaign ran five alternating pairs. Every row used 60 fresh-connect
+RTT samples, 60 persistent RTT samples, 100 send-plus-full-echo transfers of
+4 MiB, and five warmups. Server and echo were pinned to CPU 0; client and driver
+were pinned to CPU 1.
+
+| GSO | Metric | Zuicity BBR | Hysteria2 BBR | Zuicity change |
+|---|---|---:|---:|---:|
+| off | TCP throughput | **86.4353 Mbps** | 80.1244 Mbps | **+7.88%** |
+| off | Fresh-connect RTT | **0.9767 ms** | 1.8201 ms | **-46.34%** |
+| off | Persistent RTT | **0.2492 ms** | 0.3457 ms | **-27.91%** |
+| off | Combined proxy CPU | **52.27 s** | 61.57 s | **-15.11%** |
+| off | Combined process HWM | **33,996 KiB** | 51,172 KiB | **-33.57%** |
+| on | TCP throughput | **179.9396 Mbps** | 107.2110 Mbps | **+67.84%** |
+| on | Fresh-connect RTT | **0.9845 ms** | 1.8119 ms | **-45.67%** |
+| on | Persistent RTT | **0.2527 ms** | 0.3612 ms | **-30.04%** |
+| on | Combined proxy CPU | **18.52 s** | 41.97 s | **-55.87%** |
+| on | Combined process HWM | **38,264 KiB** | 53,356 KiB | **-28.29%** |
+
+Zuicity won all five paired throughput comparisons in each mode. Four traced
+probes ran before timing: both off arms recorded zero `UDP_SEGMENT` data sends,
+both on arms recorded successful segmented sends, and every arm recorded zero
+`UDP_SEGMENT` capability probes.
+
+The frozen BBR candidate identities are:
+
+- Client: `a63adaff2ec2852516ac8664bbe3b20f440234682452d0a7134d0a2a7beda11d`
+- Server: `5c1b1c2701c45cf84effe9e75b904cc249bf44789475735cecfd76f3cc039b6a`
+
+The selected congestion controller is now carried from validated client,
+server, and DAE configuration into the concrete Quinn factory. `bbr`, `cubic`,
+and `new_reno` are supported. Empty and unknown values continue to fall back to
+BBR for upstream-compatible behavior. BBR is the active candidate and default.
+
+### Experimental CUBIC comparison
+
+An explicit CUBIC experiment passed a full-size mirror against the frozen BBR
+parent and then won all five alternating pairs against Hysteria2, with a 110.69
+Mbps median. Those binaries and measurements remain archived as diagnostic
+evidence, but CUBIC is not selected for the candidate or release default.
+
+### Historical Go comparison
+
 After the optimization work, on the two-namespace veth benchmark the Rust port
 is faster than upstream Go on all four measured metrics (5-run medians):
 
@@ -150,6 +199,12 @@ the handshake reliability is preserved.
 
 Effect: throughput ~306 -> ~678 -> ~762 Mbps (now ~1.9x Go).
 
+The current implementation emits the per-message cmsg directly through a narrow
+stateless sender. It never constructs Quinn's monolithic UDP socket state, sets
+a persistent `UDP_SEGMENT` socket option, or runs a capability probe. The default
+off path keeps grouped Quinn transmits but emits ordinary datagrams through safe
+`sendmmsg`.
+
 ### 5. Non-blocking plain-send path (latent bug fix)
 
 The custom `PlainUdpSocket` plain-send path, on a socket `WouldBlock`, slept the
@@ -166,18 +221,16 @@ removed a worker-thread-blocking sleep from the hot path.
 
 ### 6. GRO receive batching and socket buffer sizing
 
-The send path used GSO but the receive path read one datagram per syscall, an
-asymmetric bottleneck at multi-hundred-Mbps throughput. The receive path now
-enables Linux UDP GRO so the kernel coalesces datagrams and one receive returns
-a super-buffer that is split back into segments by quinn's segment-size cmsg
-handling. The implementation reuses `quinn::udp::UdpSocketState` for the GRO
-receive (correct cmsg parsing into per-datagram strides) under the workspace's
-`unsafe_code = "forbid"` policy, while the send path remains the adaptive GSO
-path. ECN is still forced off on the wire and the socket silently falls back to
-the plain per-datagram receive if GRO setup fails on a hostile path. GRO is
-gated by `ZUICITY_DISABLE_GRO=1`, default on for Linux. Send and receive socket
-buffers are also sized up (4 MiB requested; the kernel clamps to its
-`net.core.rmem_max`/`wmem_max`, verified via getsockopt).
+The receive path enables Linux UDP GRO so the kernel coalesces datagrams and one
+receive returns a super-buffer that is split back into segments by the reported
+segment-size cmsg. A vendored Quinn `GroSocketState` configures the real receive
+socket and performs batched `recvmmsg` decoding without constructing the
+monolithic quinn-udp socket state, so it never executes the latter's
+`UDP_SEGMENT` capability probe. ECN remains disabled, MTU capability reporting
+is retained, and the socket falls back to plain per-datagram receives if GRO
+setup fails. GRO is gated by `ZUICITY_DISABLE_GRO=1` and defaults on for Linux.
+Send and receive socket buffers request 4 MiB; the kernel may clamp them to its
+configured maxima.
 
 A/B (GRO on vs off, 60-iter, repeated): throughput 750.7 -> 812.7 Mbps
 (~+8.3%), latency-neutral, zero errors. The three-way benchmark median rose to
@@ -226,11 +279,14 @@ throughput, latency, reliability, or compatibility regression.
 - The client dialer binds the unspecified address of the server's family
   (`0.0.0.0`/`[::]`), never loopback, so cross-host egress works.
 - Authentication happens once per connection.
-- QUIC Initial/Handshake (long-header) packets are never segmented.
-- GSO falls back per destination on `EINVAL`/`EIO` and never drops a datagram.
-- The receive path adds GRO (coalesce only, wire-invisible) but carries no ECN
-  feedback on the wire and no PMTUDISC; it falls back to plain receive on
-  GRO-hostile paths.
+- GSO is off by default. `ZUICITY_ENABLE_GSO=1` explicitly enables eligible
+  short-header groups, while `ZUICITY_DISABLE_GSO=1` takes precedence.
+- No `UDP_SEGMENT` capability probe or persistent socket option is executed.
+- Long-header handshake packets are never segmented.
+- `EINVAL`/`EIO` disables GSO per destination and immediately retries the
+  untouched group through ownership-safe ordinary `sendmmsg`.
+- The receive path adds GRO (coalesce only, wire-invisible), carries no ECN
+  feedback on the wire, and falls back to plain receive on GRO-hostile paths.
 
 ## Validation Gates (all green at completion)
 
@@ -241,10 +297,16 @@ throughput, latency, reliability, or compatibility regression.
 - `python3 scripts/validate-packaging.py`
 - Cross-host: `two-ns-runtime.sh`, `two-ns-comprehensive.sh`, `two-ns-ipv6.sh`
 - New regression tests: connection reuse (TCP and UDP), concurrent multi-UDP
-  stream reuse, GSO fallback resends both datagrams and marks the destination
-  disabled, handshake survives a GSO-hostile path, long-header packets are never
-  segmented. Run GSO-specific gates with `ZUICITY_ENABLE_GSO=1`; the default
-  release mode remains GSO off.
+  stream reuse, default-off ordinary `sendmmsg`, successful opt-in GSO,
+  `EINVAL`/`EIO` lossless fallback, long-header bypass, GRO integrity, and
+  GRO-off fallback. Controller tests downcast direct factories and live
+  connections for BBR, CUBIC, and NewReno.
+
+For the current controller qualification, the affected Linux library suites
+passed with 27 client, 30 config, 6 DAE, 65 server, 127 transport, 3 transport
+differential, and 265 Quinn-proto tests. The broader workspace runner additionally
+contains upstream-Go interop tests; those require the external Go fixture and
+toolchain and are not executable in the portable Rust-only builder image.
 
 ## Limitations
 

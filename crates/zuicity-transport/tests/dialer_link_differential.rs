@@ -133,14 +133,26 @@ fn rust_decision(link: &str) -> (bool, SchemeFamily, Option<String>, Option<u16>
 enum AllowedDivergence {
     EmptyHost,
     PortOverflow,
+    PartialSocks5Credentials,
 }
 
-fn classify_allowed_divergence(oracle: &RawOracleLine) -> Option<AllowedDivergence> {
+fn classify_allowed_divergence(link: &str, oracle: &RawOracleLine) -> Option<AllowedDivergence> {
     if oracle.host.is_empty() {
         return Some(AllowedDivergence::EmptyHost);
     }
     if oracle.port > u16::MAX as i64 {
         return Some(AllowedDivergence::PortOverflow);
+    }
+    if matches!(scheme_family(&oracle.protocol), SchemeFamily::Socks)
+        && let Ok(parsed) = url::Url::parse(link)
+    {
+        let username_set = !parsed.username().is_empty();
+        let password_set = parsed
+            .password()
+            .is_some_and(|password| !password.is_empty());
+        if username_set != password_set || parsed.password().is_some_and(str::is_empty) {
+            return Some(AllowedDivergence::PartialSocks5Credentials);
+        }
     }
     None
 }
@@ -187,10 +199,10 @@ fn compare(link: &str, oracle: &RawOracleLine) -> Result<(), TestCaseError> {
             Ok(())
         }
         (true, false) => {
-            let class = classify_allowed_divergence(oracle);
+            let class = classify_allowed_divergence(link, oracle);
             prop_assert!(
                 class.is_some(),
-                "unallowed divergence for {:?}: upstream accepts (host={:?} port={}) but Rust rejects, and it is not a documented EmptyHost/PortOverflow case",
+                "unallowed divergence for {:?}: upstream accepts (host={:?} port={}) but Rust rejects, and it is not a documented strictness case",
                 link,
                 oracle.host,
                 oracle.port

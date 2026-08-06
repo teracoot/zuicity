@@ -92,6 +92,13 @@ pub struct CertFixture {
     pub common_name: String,
 }
 
+/// Returns a filesystem path suitable for embedding in JSON consumed by Go.
+/// Go accepts slash-separated paths on Windows, while raw backslashes are JSON escapes.
+#[must_use]
+pub fn json_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Writes a self-signed certificate fixture with upstream-compatible file names.
 pub fn write_self_signed_cert_fixture(
     dir: &Path,
@@ -1090,11 +1097,18 @@ mod tests {
     fn managed_process_records_pid_log_readiness_and_teardown() -> anyhow::Result<()> {
         let dir = artifact_dir("managed process").create()?;
         let log_path = dir.path().join("process.log");
-        let mut process = ManagedProcessBuilder::new("sh")
+        #[cfg(unix)]
+        let builder = ManagedProcessBuilder::new("sh")
             .arg("-c")
-            .arg("echo process-ready; trap 'echo process-teardown; exit 0' TERM; while true; do sleep 1; done")
-            .log_path(&log_path)
-            .start()?;
+            .arg("echo process-ready; trap 'echo process-teardown; exit 0' TERM; while true; do sleep 1; done");
+        #[cfg(windows)]
+        let builder = ManagedProcessBuilder::new("powershell.exe")
+            .arg("-NoLogo")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg("'process-ready'; while ($true) { Start-Sleep -Seconds 1 }");
+        let mut process = builder.log_path(&log_path).start()?;
 
         assert_ne!(process.pid(), 0);
         assert_eq!(process.log_path(), log_path.as_path());
@@ -1103,12 +1117,18 @@ mod tests {
 
         let exit = process.terminate(Duration::from_secs(2))?;
         assert_eq!(exit.pid, process.pid());
-        assert!(exit.status.success(), "exit={exit:?}");
-        assert!(!exit.forced, "process should handle SIGTERM gracefully");
         assert!(!process.is_running()?);
-        process.wait_for_log_contains("process-teardown", Duration::from_secs(2))?;
+        #[cfg(unix)]
+        {
+            assert!(exit.status.success(), "exit={exit:?}");
+            assert!(!exit.forced, "process should handle SIGTERM gracefully");
+            process.wait_for_log_contains("process-teardown", Duration::from_secs(2))?;
+        }
+        #[cfg(windows)]
+        assert!(exit.forced, "Windows terminates the direct child process");
         let log = fs::read_to_string(&log_path)?;
         assert!(log.contains("process-ready"));
+        #[cfg(unix)]
         assert!(log.contains("process-teardown"));
         Ok(())
     }
@@ -1118,11 +1138,18 @@ mod tests {
         let dir = artifact_dir("managed drop").create()?;
         let log_path = dir.path().join("drop.log");
         let pid = {
-            let process = ManagedProcessBuilder::new("sh")
+            #[cfg(unix)]
+            let builder = ManagedProcessBuilder::new("sh")
                 .arg("-c")
-                .arg("echo drop-ready; while true; do sleep 1; done")
-                .log_path(&log_path)
-                .start()?;
+                .arg("echo drop-ready; while true; do sleep 1; done");
+            #[cfg(windows)]
+            let builder = ManagedProcessBuilder::new("powershell.exe")
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg("'drop-ready'; while ($true) { Start-Sleep -Seconds 1 }");
+            let process = builder.log_path(&log_path).start()?;
             process.wait_for_log_contains("drop-ready", Duration::from_secs(2))?;
             assert!(process.is_running()?);
             process.pid()

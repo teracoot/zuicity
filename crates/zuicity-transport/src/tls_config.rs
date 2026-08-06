@@ -38,12 +38,9 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
     if policy.disable_path_mtu_discovery {
         inner.mtu_discovery_config(None);
     }
-    // UDP GSO is gated by [`GsoMode`]. In [`GsoMode::Auto`] quinn-proto is
-    // allowed to coalesce several datagrams into one segmented transmit
-    // (`Transmit { segment_size: Some(..) }`); the adaptive [`PlainUdpSocket`]
-    // then attempts a single per-message `UDP_SEGMENT` sendmsg with same-call
-    // fallback, and never segments long-header (Initial/Handshake) packets, so
-    // GSO-hostile paths (quinn-rs/quinn#2575, #2202) cannot strand the
+    // Let Quinn group datagrams into `Transmit` values. PlainUdpSocket emits
+    // ordinary datagrams by default and may use per-message UDP GSO only under
+    // the explicit Linux opt-in.
     let segmentation_offload_enabled = cfg!(target_os = "linux");
     inner.enable_segmentation_offload(segmentation_offload_enabled);
     apply_congestion_controller(&mut inner, policy);
@@ -57,16 +54,24 @@ pub fn build_transport_config(policy: &QuicRuntimePolicy) -> BuiltTransportConfi
 
 /// Installs the policy's congestion controller on a quinn [`TransportConfig`].
 ///
-/// Quinn defaults to CUBIC; upstream Juicity negotiates `congestion_control=bbr`,
-/// so without this hook zuicity advertised BBR but ran CUBIC. Upstream's hook
-/// ignores the configured `cwnd` argument and its BBR starts at 32 packets.
+/// Quinn defaults to CUBIC; Juicity defaults to BBR and may explicitly select
+/// CUBIC or NewReno. Upstream's BBR hook ignores the configured `cwnd` argument
+/// and starts at 32 packets.
 fn apply_congestion_controller(inner: &mut quinn::TransportConfig, policy: &QuicRuntimePolicy) {
+    inner.congestion_controller_factory(congestion_controller_factory(policy));
+}
+
+pub(crate) fn congestion_controller_factory(
+    policy: &QuicRuntimePolicy,
+) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match policy.congestion_controller {
         CongestionController::Bbr => {
             let mut bbr = quinn::congestion::BbrConfig::default();
             bbr.initial_window(bbr_initial_window_bytes());
-            inner.congestion_controller_factory(std::sync::Arc::new(bbr));
+            Arc::new(bbr)
         }
+        CongestionController::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+        CongestionController::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
     }
 }
 
@@ -156,14 +161,22 @@ pub fn build_client_config_with_roots(
     allow_insecure: bool,
 ) -> Result<QuicClientConfig, TransportError> {
     let policy = QuicRuntimePolicy::upstream_client();
+    build_client_config_with_roots_and_policy(roots_pem, allow_insecure, &policy)
+}
+
+pub(crate) fn build_client_config_with_roots_and_policy(
+    roots_pem: &[u8],
+    allow_insecure: bool,
+    policy: &QuicRuntimePolicy,
+) -> Result<QuicClientConfig, TransportError> {
     let crypto = build_client_crypto_config_with_roots(roots_pem, allow_insecure)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config.transport_config(build_transport_config(&policy).into_arc());
+    config.transport_config(build_transport_config(policy).into_arc());
     Ok(QuicClientConfig {
         inner: config,
-        policy,
+        policy: policy.clone(),
     })
 }
 
@@ -190,16 +203,16 @@ fn build_client_crypto_config_with_webpki_roots(
 
 pub(crate) fn build_client_config_with_webpki_roots(
     allow_insecure: bool,
+    policy: &QuicRuntimePolicy,
 ) -> Result<QuicClientConfig, TransportError> {
-    let policy = QuicRuntimePolicy::upstream_client();
     let crypto = build_client_crypto_config_with_webpki_roots(allow_insecure)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config.transport_config(build_transport_config(&policy).into_arc());
+    config.transport_config(build_transport_config(policy).into_arc());
     Ok(QuicClientConfig {
         inner: config,
-        policy,
+        policy: policy.clone(),
     })
 }
 
@@ -226,14 +239,21 @@ pub fn build_client_config_with_cert_chain_pin(
     pinned_cert_chain_sha256: &[u8],
 ) -> Result<QuicClientConfig, TransportError> {
     let policy = QuicRuntimePolicy::upstream_client();
+    build_client_config_with_cert_chain_pin_and_policy(pinned_cert_chain_sha256, &policy)
+}
+
+pub(crate) fn build_client_config_with_cert_chain_pin_and_policy(
+    pinned_cert_chain_sha256: &[u8],
+    policy: &QuicRuntimePolicy,
+) -> Result<QuicClientConfig, TransportError> {
     let crypto = build_client_crypto_config_with_cert_chain_pin(pinned_cert_chain_sha256)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    config.transport_config(build_transport_config(&policy).into_arc());
+    config.transport_config(build_transport_config(policy).into_arc());
     Ok(QuicClientConfig {
         inner: config,
-        policy,
+        policy: policy.clone(),
     })
 }
 

@@ -1,26 +1,20 @@
-/// Selects whether the adaptive UDP socket may attempt Linux UDP GSO
-/// (`UDP_SEGMENT`) on eligible egress, or always falls back to one datagram per
-/// segment (the historical safe behaviour).
+/// Zuicity's UDP send policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GsoMode {
-    /// Never attempt GSO; send one datagram per segment. Always safe.
+    /// Never issue `UDP_SEGMENT`; grouped transmits use ordinary datagrams.
     Off,
-    /// Attempt GSO on eligible short-header batched transmits, with per-message
-    /// `UDP_SEGMENT` cmsg and same-call fallback to plain datagrams on the first
-    /// `EINVAL`/`EIO` from a destination. Enabled only by explicit opt-in on
-    /// Linux.
+    /// Attempt GSO on eligible grouped short-header transmits, with adaptive
+    /// per-destination fallback to ordinary datagrams.
     Auto,
 }
 
 impl GsoMode {
-    /// Keeps the aggregate `UDP_SEGMENT` message below the IPv4 UDP size limit
-    /// at supported QUIC MTUs; Linux's 64-segment count limit alone is too high.
+    /// Maximum safe segment count for one UDP GSO super-message at normal QUIC MTUs.
     const MAX_GSO_SEGMENTS: usize = 44;
 
-    /// Resolves the production GSO mode from the environment. GSO is opt-in:
-    /// `ZUICITY_ENABLE_GSO=1` (or `true`) enables [`GsoMode::Auto`], while
-    /// unset, invalid, or `ZUICITY_DISABLE_GSO=1` keeps [`GsoMode::Off`]. On
-    /// non-Linux targets GSO is always [`GsoMode::Off`].
+    /// Resolves the production GSO mode. GSO is off unless explicitly enabled
+    /// with `ZUICITY_ENABLE_GSO=1` or `true`. `ZUICITY_DISABLE_GSO` takes
+    /// precedence, and non-Linux targets are always off.
     #[must_use]
     pub fn from_env() -> Self {
         let enable = std::env::var("ZUICITY_ENABLE_GSO").ok();
@@ -42,10 +36,22 @@ impl GsoMode {
     pub(crate) const fn max_transmit_segments(self, plain_batch_segments: usize) -> usize {
         match self {
             Self::Off => plain_batch_segments,
-            Self::Auto if plain_batch_segments > Self::MAX_GSO_SEGMENTS => Self::MAX_GSO_SEGMENTS,
-            Self::Auto => plain_batch_segments,
+            Self::Auto => {
+                if plain_batch_segments > Self::MAX_GSO_SEGMENTS {
+                    Self::MAX_GSO_SEGMENTS
+                } else {
+                    plain_batch_segments
+                }
+            }
         }
     }
+}
+
+fn env_flag_is_set(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 pub(crate) fn plain_batch_segments_from_env(default_segments: usize) -> usize {
@@ -80,13 +86,6 @@ pub(crate) fn plain_batch_segments_from_value(
     1
 }
 
-fn env_flag_is_set(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true")
-    })
-}
-
 /// Selects whether the adaptive UDP socket enables Linux UDP GRO
 /// (`UDP_GRO`) on the receive path, coalescing several same-sized datagrams
 /// into one `recvmsg` and splitting the super-buffer back into segments via the
@@ -114,8 +113,8 @@ impl GroMode {
     /// per-slot buffer growth.
     const MAX_GRO_SEGMENTS: usize = 64;
 
-    /// Resolves the production GRO mode from the environment, mirroring
-    /// [`GsoMode::from_env`]. `ZUICITY_DISABLE_GRO=1` (or `true`) forces
+    /// Resolves the production GRO mode from the environment.
+    /// `ZUICITY_DISABLE_GRO=1` (or `true`) forces
     /// [`GroMode::Off`]; anything else (including unset) is [`GroMode::Auto`].
     /// On non-Linux targets GRO is always [`GroMode::Off`].
     #[must_use]

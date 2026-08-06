@@ -11,9 +11,10 @@ use std::{
 use zuicity_config::ServerConfig;
 use zuicity_protocol::AtomicCounter64;
 use zuicity_transport::{
-    DEFAULT_NAT_TIMEOUT, JuicityQuicServer, MAX_PENDING_SERVER_AUTHENTICATIONS, ProxyEgressPolicy,
-    ProxyProtocol, ProxyRelayReport, QuicRuntimePolicy, StreamPolicy, TcpProxyRelayReport,
-    TlsPolicy, UdpOverStreamRelayReport, run_tuic_udp_datagram_relay,
+    CongestionController, DEFAULT_NAT_TIMEOUT, JuicityQuicServer,
+    MAX_PENDING_SERVER_AUTHENTICATIONS, ProxyEgressPolicy, ProxyProtocol, ProxyRelayReport,
+    QuicRuntimePolicy, StreamPolicy, TcpProxyRelayReport, TlsPolicy, UdpOverStreamRelayReport,
+    run_tuic_udp_datagram_relay,
 };
 
 const PROXY_SHUTDOWN_RELAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
@@ -52,11 +53,17 @@ impl ServerRuntimeConfig {
     /// Builds runtime options from validated server config and upstream default policies.
     #[must_use]
     pub fn from_config(config: ServerConfig) -> Self {
+        let mut quic = QuicRuntimePolicy::upstream_server();
+        quic.congestion_controller = CongestionController::from_config_name(
+            config
+                .congestion_control
+                .map(zuicity_config::CongestionControl::as_str),
+        );
         Self {
             config,
             tls: TlsPolicy::upstream(),
             streams: StreamPolicy::upstream(),
-            quic: QuicRuntimePolicy::upstream_server(),
+            quic,
         }
     }
 
@@ -1343,6 +1350,27 @@ mod tests {
         Ok(ServerRuntimeConfig::from_config(validate_server(
             load_json_str(json)?,
         )?))
+    }
+
+    #[test]
+    fn server_runtime_maps_configured_congestion_controller_into_quic_policy()
+    -> Result<(), ConfigError> {
+        for (value, expected) in [
+            (Some("bbr"), CongestionController::Bbr),
+            (Some("cubic"), CongestionController::Cubic),
+            (Some("new_reno"), CongestionController::NewReno),
+            (None, CongestionController::Bbr),
+            (Some("unknown"), CongestionController::Bbr),
+        ] {
+            let field = value.map_or_else(String::new, |value| {
+                format!(r#", "congestion_control": "{value}""#)
+            });
+            let config = server_config(&format!(
+                r#"{{"listen":"127.0.0.1:0","users":{{"00000000-0000-0000-0000-000000000001":"password"}}{field}}}"#,
+            ))?;
+            assert_eq!(config.quic.congestion_controller, expected);
+        }
+        Ok(())
     }
 
     async fn wait_for_server_metrics(
@@ -5498,12 +5526,17 @@ mod tests {
             cert.key_pair.serialize_pem().as_bytes(),
         )?;
         let server_addr = bound.local_addr()?;
+        let metrics = ServerMetrics::default();
+        let hooks = ServerRuntimeHooks::new(metrics.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
             bound
-                .run_proxy_loop_until(async {
-                    let _ = shutdown_rx.await;
-                })
+                .run_proxy_loop_until_with_hooks(
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    hooks,
+                )
                 .await
         });
 
@@ -5524,7 +5557,12 @@ mod tests {
             .await?;
         let _ = failing_stream.write_all(b"no target").await;
         let _ = failing_stream.finish();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            failing_stream.read_to_end(1024),
+        )
+        .await;
+        wait_for_server_metrics(&metrics, |snapshot| snapshot.failed_proxy_streams == 1).await;
 
         let good_client = zuicity_transport::JuicityQuicClient::bind(([127, 0, 0, 1], 0).into())?;
         let good_connection = tokio::time::timeout(
@@ -5549,7 +5587,7 @@ mod tests {
         let echoed = stream.read_to_end(1024).await?;
         assert_eq!(echoed, b"after failed stream");
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_server_metrics(&metrics, |snapshot| snapshot.completed_tcp_relays == 1).await;
         shutdown_tx.send(()).expect("send shutdown");
         let report = server_task.await??;
         assert_eq!(report.accepted_connections, 2);

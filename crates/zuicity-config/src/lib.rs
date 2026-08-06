@@ -487,17 +487,16 @@ pub fn socks5_dialer_link_from_outbound(
 
     let userinfo = match (outbound.username.is_empty(), outbound.password.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => format!("{}@", percent_encode_userinfo(&outbound.username)),
-        (true, false) => {
-            return Err(ConfigError::InvalidOutbound(
-                "password requires username".to_owned(),
-            ));
-        }
         (false, false) => format!(
             "{}:{}@",
             percent_encode_userinfo(&outbound.username),
             percent_encode_userinfo(&outbound.password)
         ),
+        _ => {
+            return Err(ConfigError::InvalidOutbound(
+                "SOCKS5 username and password must either both be set or both be empty".to_owned(),
+            ));
+        }
     };
 
     Ok(format!("socks5://{userinfo}{authority}:{port}"))
@@ -731,6 +730,19 @@ fn parse_u32_digits_with_go_underscores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn congestion_control_names_round_trip() {
+        for (name, expected) in [
+            ("bbr", CongestionControl::Bbr),
+            ("cubic", CongestionControl::Cubic),
+            ("new_reno", CongestionControl::NewReno),
+        ] {
+            assert_eq!(CongestionControl::parse(name).unwrap(), expected);
+            assert_eq!(expected.as_str(), name);
+        }
+        assert!(CongestionControl::parse("unknown").is_err());
+    }
 
     #[test]
     fn parses_upstream_client_example_shape() -> Result<(), ConfigError> {
@@ -1341,5 +1353,74 @@ mod tests {
             "socks5://127.0.0.1:10808"
         );
         Ok(())
+    }
+
+    #[test]
+    fn socks5_outbound_accepts_alias_version_and_credential_boundaries() -> Result<(), ConfigError>
+    {
+        let boundary = "x".repeat(255);
+        let outbound = RawOutboundConfig {
+            outbound_type: "5".to_owned(),
+            server: " proxy.example ".to_owned(),
+            server_port: Some(1080),
+            username: boundary.clone(),
+            password: boundary.clone(),
+            version: "5".to_owned(),
+        };
+        let link = socks5_dialer_link_from_outbound(&outbound)?;
+        assert_eq!(
+            link,
+            format!("socks5://{boundary}:{boundary}@proxy.example:1080")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn socks5_outbound_rejects_bad_version_password_without_username_and_blank_server() {
+        for (outbound, expected) in [
+            (
+                RawOutboundConfig {
+                    server: "127.0.0.1".to_owned(),
+                    server_port: Some(1080),
+                    version: "4".to_owned(),
+                    ..RawOutboundConfig::default()
+                },
+                "unsupported version",
+            ),
+            (
+                RawOutboundConfig {
+                    server: "127.0.0.1".to_owned(),
+                    server_port: Some(1080),
+                    password: "password".to_owned(),
+                    ..RawOutboundConfig::default()
+                },
+                "both be set",
+            ),
+            (
+                RawOutboundConfig {
+                    server: "127.0.0.1".to_owned(),
+                    server_port: Some(1080),
+                    username: "username".to_owned(),
+                    ..RawOutboundConfig::default()
+                },
+                "both be set",
+            ),
+            (
+                RawOutboundConfig {
+                    server: "   ".to_owned(),
+                    server_port: Some(1080),
+                    ..RawOutboundConfig::default()
+                },
+                "server is required",
+            ),
+        ] {
+            let error = socks5_dialer_link_from_outbound(&outbound)
+                .expect_err("invalid SOCKS5 outbound must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
     }
 }

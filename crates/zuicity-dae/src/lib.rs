@@ -19,7 +19,8 @@ use tokio::{
 use zuicity_config::{ClientConfig, CongestionControl, ForwardRule};
 use zuicity_protocol::AtomicCounter64;
 use zuicity_transport::{
-    AuthenticatedConnection, JuicityQuicClient, TcpProxyStream, UdpOverStream,
+    AuthenticatedConnection, CongestionController, JuicityQuicClient, QuicRuntimePolicy,
+    TcpProxyStream, UdpOverStream,
 };
 
 /// zae outbound-facing Juicity configuration.
@@ -76,6 +77,14 @@ impl DaeOutboundConfig {
     #[must_use]
     pub fn congestion_control(&self) -> Option<CongestionControl> {
         self.client.congestion_control
+    }
+
+    fn quic_policy(&self) -> QuicRuntimePolicy {
+        let mut policy = QuicRuntimePolicy::upstream_client();
+        policy.congestion_controller = CongestionController::from_config_name(
+            self.congestion_control().map(CongestionControl::as_str),
+        );
+        policy
     }
 
     /// Returns the decoded pinned certificate-chain hash, if configured.
@@ -480,7 +489,9 @@ where
 
     async fn connect_authenticated(&self) -> Result<AuthenticatedConnection, DaeAdapterError> {
         let server_addr = resolve_server_addr(self.config.server()).await?;
-        let client = JuicityQuicClient::bind(local_client_bind_addr(server_addr))?;
+        let policy = self.config.quic_policy();
+        let client =
+            JuicityQuicClient::bind_with_policy(local_client_bind_addr(server_addr), &policy)?;
         let server_name = self.config.tls_server_name();
         if let Some(pin) = self.config.pinned_certchain_sha256() {
             return Ok(client
@@ -864,6 +875,27 @@ mod tests {
         Ok(zuicity_server::ServerRuntimeConfig::from_config(
             validate_server(load_json_str(json)?)?,
         ))
+    }
+
+    #[test]
+    fn dae_runtime_maps_configured_congestion_controller_into_quic_policy()
+    -> Result<(), ConfigError> {
+        for (value, expected) in [
+            (Some("bbr"), CongestionController::Bbr),
+            (Some("cubic"), CongestionController::Cubic),
+            (Some("new_reno"), CongestionController::NewReno),
+            (None, CongestionController::Bbr),
+            (Some("unknown"), CongestionController::Bbr),
+        ] {
+            let field = value.map_or_else(String::new, |value| {
+                format!(r#", "congestion_control": "{value}""#)
+            });
+            let outbound = client_config(&format!(
+                r#"{{"server":"127.0.0.1:9443","uuid":"00000000-0000-0000-0000-000000000001","password":"password"{field}}}"#,
+            ))?;
+            assert_eq!(outbound.quic_policy().congestion_controller, expected);
+        }
+        Ok(())
     }
 
     #[test]

@@ -41,6 +41,16 @@ impl Socks5DialerLink {
             .password()
             .map(|password| percent_decode_utf8(raw, password, "SOCKS5 password"))
             .transpose()?;
+        if username.is_some() != password.is_some()
+            || username.as_ref().is_some_and(String::is_empty)
+            || password.as_ref().is_some_and(String::is_empty)
+        {
+            return Err(TransportError::InvalidProxyDialerLink {
+                link: raw.to_owned(),
+                message: "SOCKS5 username and password must either both be set or both be absent"
+                    .to_owned(),
+            });
+        }
         Ok(Self {
             host,
             port,

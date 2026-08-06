@@ -114,6 +114,22 @@ impl Default for TlsPolicy {
 pub enum CongestionController {
     /// BBR congestion control.
     Bbr,
+    /// CUBIC congestion control.
+    Cubic,
+    /// NewReno congestion control.
+    NewReno,
+}
+
+impl CongestionController {
+    /// Maps an upstream configuration value, defaulting absent or unknown names to BBR.
+    #[must_use]
+    pub fn from_config_name(value: Option<&str>) -> Self {
+        match value {
+            Some("cubic") => Self::Cubic,
+            Some("new_reno") => Self::NewReno,
+            _ => Self::Bbr,
+        }
+    }
 }
 
 /// QUIC receive window policy.

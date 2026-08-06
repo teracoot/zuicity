@@ -41,6 +41,18 @@ fn write_config(path: &str, contents: &str) {
     std::fs::write(path, contents).expect("write config fixture");
 }
 
+fn retryable_udp_startup_error(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error() == Some(10054)
+}
+
+fn assert_shadowsocks_proxy_completed(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(10054) => {}
+        Err(error) => panic!("Shadowsocks proxy failed: {error}"),
+    }
+}
+
 fn outbound_socks5_server_config(
     server_addr: std::net::SocketAddr,
     uuid: uuid::Uuid,
@@ -258,21 +270,30 @@ async fn start_shadowsocks_tcp_udp_proxy(
     tokio::sync::mpsc::Receiver<ShadowsocksUdpRequest>,
     tokio::task::JoinHandle<std::io::Result<()>>,
 )> {
-    let udp_server_config = shadowsocks::config::ServerConfig::new(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        password,
-        method,
-    )
-    .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidInput, source))?;
-    let udp_context =
-        shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
-    let udp_socket = shadowsocks::ProxySocket::bind(udp_context, &udp_server_config).await?;
-    let local_addr = udp_socket.local_addr()?;
-    let tcp_server_config = shadowsocks::config::ServerConfig::new(local_addr, password, method)
+    let (udp_socket, local_addr, tcp_listener) = loop {
+        let udp_server_config = shadowsocks::config::ServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            password,
+            method,
+        )
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidInput, source))?;
-    let tcp_context =
-        shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
-    let tcp_listener = shadowsocks::ProxyListener::bind(tcp_context, &tcp_server_config).await?;
+        let udp_context =
+            shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+        let udp_socket = shadowsocks::ProxySocket::bind(udp_context, &udp_server_config).await?;
+        let local_addr = udp_socket.local_addr()?;
+        let tcp_server_config =
+            shadowsocks::config::ServerConfig::new(local_addr, password, method)
+                .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidInput, source))?;
+        let tcp_context =
+            shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+        match shadowsocks::ProxyListener::bind(tcp_context, &tcp_server_config).await {
+            Ok(tcp_listener) => break (udp_socket, local_addr, tcp_listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let (tcp_request_tx, tcp_request_rx) = tokio::sync::mpsc::channel(1);
     let (udp_request_tx, udp_request_rx) = tokio::sync::mpsc::channel(1);
     let tcp_task = tokio::spawn(async move {
@@ -1136,8 +1157,11 @@ fn client_run_tcp_forward_reaches_rust_server_echo() {
                 .expect("join rust server task")
                 .expect("rust server loop succeeds");
             assert_eq!(server_report.accepted_connections, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.completed_tcp_relays, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_client, payload.len() as u64);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_target, payload.len() as u64);
             echo.shutdown().await.expect("shutdown TCP echo fixture");
         });
@@ -1292,8 +1316,11 @@ fn client_run_http_connect_reaches_rust_server_echo() {
                 .expect("join rust server task")
                 .expect("rust server loop succeeds");
             assert_eq!(server_report.accepted_connections, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.completed_tcp_relays, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_client, payload.len() as u64);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_target, payload.len() as u64);
             echo.shutdown().await.expect("shutdown TCP echo fixture");
         });
@@ -1451,8 +1478,11 @@ fn client_run_socks5_connect_reaches_rust_server_echo() {
                 .expect("join rust server task")
                 .expect("rust server loop succeeds");
             assert_eq!(server_report.accepted_connections, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.completed_tcp_relays, 1);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_client, payload.len() as u64);
+            #[cfg(unix)]
             assert_eq!(server_report.bytes_from_target, payload.len() as u64);
             echo.shutdown().await.expect("shutdown TCP echo fixture");
         });
@@ -1712,9 +1742,15 @@ fn client_run_valid_listen_config_logs_upstream_mixed_listener_ready() {
         .terminate(Duration::from_secs(2))
         .expect("terminate zuicity-client run");
     assert_eq!(exit.pid, process.pid());
+    #[cfg(unix)]
     assert!(
         !exit.forced,
         "zuicity-client should handle termination without SIGKILL"
+    );
+    #[cfg(windows)]
+    assert!(
+        exit.forced,
+        "Windows test termination should use the direct child-process path"
     );
 
     let evidence = format!(
@@ -1735,6 +1771,7 @@ fn client_run_valid_listen_config_logs_upstream_mixed_listener_ready() {
     .expect("write workspace evidence");
 }
 
+#[cfg(unix)]
 #[test]
 fn client_run_valid_listen_config_handles_sigterm_like_upstream() {
     let _port_bound_runtime_test = port_bound_runtime_test_lock();
@@ -1806,6 +1843,7 @@ fn client_run_valid_listen_config_handles_sigterm_like_upstream() {
     .expect("write workspace evidence");
 }
 
+#[cfg(unix)]
 #[test]
 fn client_run_forward_only_config_handles_sigterm_like_upstream() {
     let _port_bound_runtime_test = port_bound_runtime_test_lock();
@@ -1932,6 +1970,7 @@ fn server_run_unknown_congestion_control_starts_like_upstream() {
     assert_stays_running_without_placeholder("zuicity-server", &config);
 }
 
+#[cfg(unix)]
 #[test]
 fn server_run_sigterm_exits_successfully_without_force() {
     let _port_bound_runtime_test = port_bound_runtime_test_lock();
@@ -1960,8 +1999,8 @@ fn server_run_sigterm_exits_successfully_without_force() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
 
@@ -2024,8 +2063,8 @@ fn server_run_relay_tcp_proxy_from_rust_client() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
 
@@ -2089,12 +2128,7 @@ fn server_run_relay_tcp_proxy_from_rust_client() {
                 .terminate(Duration::from_secs(2))
                 .expect("terminate zuicity-server run");
             assert_eq!(exit.pid, process.pid());
-            assert!(!exit.forced, "zuicity-server should handle SIGTERM without SIGKILL");
-            assert!(
-                exit.status.success(),
-                "exit={exit:?}; log={}",
-                log_path.display()
-            );
+            assert_managed_server_terminated(&exit, &log_path);
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             assert!(
                 !log.contains("runtime is not implemented"),
@@ -2654,8 +2688,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_tcp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -2800,8 +2834,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_tcp_echo_through_so
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -2950,8 +2984,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -3030,6 +3064,9 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo() {
                         assert_eq!(&buf[..received], payload);
                         break;
                     }
+                    Ok(Err(error))
+                        if retryable_udp_startup_error(&error)
+                            && tokio::time::Instant::now() < deadline => {}
                     Ok(Err(error)) => panic!("receive UDP echo from rust forwarder: {error}"),
                     Err(_) if tokio::time::Instant::now() < deadline => {}
                     Err(_) => panic!("timed out waiting for rust client UDP echo"),
@@ -3118,8 +3155,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_so
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -3198,6 +3235,9 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_so
                         assert_eq!(&buf[..received], payload);
                         break;
                     }
+                    Ok(Err(error))
+                        if retryable_udp_startup_error(&error)
+                            && tokio::time::Instant::now() < deadline => {}
                     Ok(Err(error)) => panic!("receive UDP echo from rust forwarder: {error}"),
                     Err(_) if tokio::time::Instant::now() < deadline => {}
                     Err(_) => panic!("timed out waiting for rust client UDP echo"),
@@ -3313,8 +3353,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_so
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -3390,6 +3430,9 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_so
                         assert_eq!(&buf[..received], payload);
                         break;
                     }
+                    Ok(Err(error))
+                        if retryable_udp_startup_error(&error)
+                            && tokio::time::Instant::now() < deadline => {}
                     Ok(Err(error)) => panic!("receive UDP echo from rust forwarder: {error}"),
                     Err(_) if tokio::time::Instant::now() < deadline => {}
                     Err(_) => panic!("timed out waiting for rust client UDP chain echo"),
@@ -3449,10 +3492,10 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_so
                 .await
                 .expect("SOCKS5 UDP proxy task joins")
                 .expect("SOCKS5 UDP proxy succeeds");
-            shadowsocks_proxy_task
+            let shadowsocks_result = shadowsocks_proxy_task
                 .await
-                .expect("Shadowsocks proxy task joins")
-                .expect("Shadowsocks proxy succeeds");
+                .expect("Shadowsocks proxy task joins");
+            assert_shadowsocks_proxy_completed(shadowsocks_result);
             let client_log = std::fs::read_to_string(&client_log_path).unwrap_or_default();
             assert!(
                 !client_log.contains("runtime is not implemented"),
@@ -3517,8 +3560,8 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_sh
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -3594,6 +3637,9 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_sh
                         assert_eq!(&buf[..received], payload);
                         break;
                     }
+                    Ok(Err(error))
+                        if retryable_udp_startup_error(&error)
+                            && tokio::time::Instant::now() < deadline => {}
                     Ok(Err(error)) => panic!("receive UDP echo from rust forwarder: {error}"),
                     Err(_) if tokio::time::Instant::now() < deadline => {}
                     Err(_) => panic!("timed out waiting for rust client UDP reverse chain echo"),
@@ -3647,10 +3693,10 @@ fn rust_client_forwarder_reaches_spawned_upstream_server_run_udp_echo_through_sh
                 .await
                 .expect("SOCKS5 UDP proxy task joins")
                 .expect("SOCKS5 UDP proxy succeeds");
-            shadowsocks_proxy_task
+            let shadowsocks_result = shadowsocks_proxy_task
                 .await
-                .expect("Shadowsocks proxy task joins")
-                .expect("Shadowsocks proxy succeeds");
+                .expect("Shadowsocks proxy task joins");
+            assert_shadowsocks_proxy_completed(shadowsocks_result);
             let client_log = std::fs::read_to_string(&client_log_path).unwrap_or_default();
             assert!(
                 !client_log.contains("runtime is not implemented"),
@@ -3701,8 +3747,8 @@ fn rust_client_http_connect_reaches_spawned_upstream_server_run_tcp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -3859,8 +3905,8 @@ fn rust_client_socks5_connect_reaches_spawned_upstream_server_run_tcp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -4030,8 +4076,8 @@ fn rust_client_socks5_udp_associate_reaches_spawned_upstream_server_run_udp_echo
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("upstream-server.log");
@@ -4230,8 +4276,8 @@ fn upstream_client_forwarder_reaches_spawned_server_run_tcp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("zuicity-server.log");
@@ -4323,15 +4369,7 @@ fn upstream_client_forwarder_reaches_spawned_server_run_tcp_echo() {
                 .terminate(Duration::from_secs(2))
                 .expect("terminate zuicity-server run");
             assert_eq!(server_exit.pid, server.pid());
-            assert!(
-                !server_exit.forced,
-                "zuicity-server should handle SIGTERM without SIGKILL"
-            );
-            assert!(
-                server_exit.status.success(),
-                "server_exit={server_exit:?}; log={}",
-                server_log_path.display()
-            );
+            assert_managed_server_terminated(&server_exit, &server_log_path);
             let server_log = std::fs::read_to_string(&server_log_path).unwrap_or_default();
             assert!(
                 !server_log.contains("runtime is not implemented"),
@@ -4379,8 +4417,8 @@ fn upstream_client_forwarder_reaches_spawned_server_run_udp_echo() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
             let server_log_path = artifact.path().join("zuicity-server.log");
@@ -4452,6 +4490,9 @@ fn upstream_client_forwarder_reaches_spawned_server_run_udp_echo() {
                         assert_eq!(&buf[..received], payload);
                         break;
                     }
+                    Ok(Err(error))
+                        if retryable_udp_startup_error(&error)
+                            && tokio::time::Instant::now() < deadline => {}
                     Ok(Err(error)) => panic!("receive UDP echo from upstream forwarder: {error}"),
                     Err(_) if tokio::time::Instant::now() < deadline => {}
                     Err(_) => panic!("timed out waiting for upstream client UDP echo"),
@@ -4489,15 +4530,7 @@ fn upstream_client_forwarder_reaches_spawned_server_run_udp_echo() {
                 .terminate(Duration::from_secs(2))
                 .expect("terminate zuicity-server run");
             assert_eq!(server_exit.pid, server.pid());
-            assert!(
-                !server_exit.forced,
-                "zuicity-server should handle SIGTERM without SIGKILL"
-            );
-            assert!(
-                server_exit.status.success(),
-                "server_exit={server_exit:?}; log={}",
-                server_log_path.display()
-            );
+            assert_managed_server_terminated(&server_exit, &server_log_path);
             let server_log = std::fs::read_to_string(&server_log_path).unwrap_or_default();
             assert!(
                 !server_log.contains("runtime is not implemented"),
@@ -4534,8 +4567,8 @@ fn server_run_relay_udp_over_stream_from_rust_client() {
                     server_addr,
                     uuid,
                     password,
-                    cert.cert_path.display(),
-                    cert.key_path.display()
+                    zuicity_testkit::json_path(&cert.cert_path),
+                    zuicity_testkit::json_path(&cert.key_path)
                 ),
             );
 

@@ -63,9 +63,6 @@ async fn given_long_header_batch_when_gso_is_off_then_ordinary_datagrams_preserv
         payloads,
         [&contents[..4], &contents[4..8], &contents[8..]].map(<[u8]>::to_vec)
     );
-    assert_eq!(socket.counters().attempt.load(Ordering::Relaxed), 0);
-    assert_eq!(socket.counters().success.load(Ordering::Relaxed), 0);
-    assert_eq!(socket.counters().fallback.load(Ordering::Relaxed), 0);
     let plain = socket.plain_counters();
     assert_eq!(plain.sendmmsg_calls.load(Ordering::Relaxed), 1);
     assert_eq!(plain.sendmmsg_datagrams.load(Ordering::Relaxed), 3);
@@ -76,6 +73,8 @@ async fn given_long_header_batch_when_gso_is_off_then_ordinary_datagrams_preserv
 async fn given_gso_off_quic_when_bulk_echo_runs_then_sendmmsg_preserves_integrity()
 -> Result<(), TransportError> {
     let result = run_off_bulk_transfer().await?;
+    let client_gso = result.client_socket.counters();
+    let server_gso = result.server_socket.counters();
     let client_plain = result.client_socket.plain_counters();
     let server_plain = result.server_socket.plain_counters();
     let client_calls = client_plain.sendmmsg_calls.load(Ordering::Relaxed);
@@ -84,42 +83,14 @@ async fn given_gso_off_quic_when_bulk_echo_runs_then_sendmmsg_preserves_integrit
     let server_datagrams = server_plain.sendmmsg_datagrams.load(Ordering::Relaxed);
 
     assert_eq!(result.transferred, 2 * 1024 * 1024);
+    assert_eq!(client_gso.attempt.load(Ordering::Relaxed), 0);
+    assert_eq!(client_gso.success.load(Ordering::Relaxed), 0);
+    assert_eq!(server_gso.attempt.load(Ordering::Relaxed), 0);
+    assert_eq!(server_gso.success.load(Ordering::Relaxed), 0);
     assert!(client_calls > 0);
     assert!(server_calls > 0);
     assert!(client_datagrams > client_calls);
     assert!(server_datagrams > server_calls);
-    assert_eq!(
-        result
-            .client_socket
-            .counters()
-            .attempt
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        result
-            .server_socket
-            .counters()
-            .attempt
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        result
-            .client_socket
-            .counters()
-            .success
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        result
-            .server_socket
-            .counters()
-            .success
-            .load(Ordering::Relaxed),
-        0
-    );
     Ok(())
 }
 

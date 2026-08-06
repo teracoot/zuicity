@@ -88,17 +88,20 @@ must be reported and must not be described as the unchanged canonical profile.
 
 Run separate traced probes before any untraced measured row:
 
-- GSO-on passes only after a successful `UDP_SEGMENT` send.
-- GSO-off passes only when no `UDP_SEGMENT` send is attempted.
-- Accept symbolic `UDP_SEGMENT` or Linux cmsg type `0x67`/`103` only at
-  `SOL_UDP`/`IPPROTO_UDP` level.
+- GSO-on passes only after a successful `UDP_SEGMENT` data send.
+- GSO-off passes only when no `UDP_SEGMENT` data send is attempted.
+- Every treatment requires zero `UDP_SEGMENT` capability probes or persistent
+  socket-option writes.
+- Count symbolic `UDP_SEGMENT` and Linux numeric `0x67`/`103` forms in both
+  `setsockopt` and send cmsgs at `SOL_UDP`/`IPPROTO_UDP` level.
 - Preserve raw trace shards for audit, but do not time measured rows under
   `strace`.
 - Fail the campaign on a probe mismatch; do not downgrade it to a warning.
 
-Record the exact environment set/unset operations. For the pinned suite, Rust
-uses `ZUICITY_ENABLE_GSO=1` for on and `ZUICITY_DISABLE_GSO=1` for off. Repaired
-Go uses an empty `QUIC_GO_DISABLE_GSO` for on and `true` for off.
+Record the exact environment set/unset operations. Zuicity uses
+`ZUICITY_ENABLE_GSO=1` for on and `ZUICITY_DISABLE_GSO=1` for off, with the
+opposite variable unset. Hysteria/quic-go uses an unset `QUIC_GO_DISABLE_GSO`
+for on and `true` for off.
 
 ## Host controls and quality gates
 

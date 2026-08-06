@@ -8,13 +8,15 @@ use zuicity_benchmarks::probe_socket_fwmark_support;
 use zuicity_benchmarks::{
     LiveServerFixture, MixedTcpBenchmarkMode, ServerEgressTcpBenchmarkMode,
     ServerEgressUdpBenchmarkMode, THROUGHPUT_MATRIX_CONCURRENCY, THROUGHPUT_MATRIX_PAYLOAD_SIZES,
-    connect_client, current_process_memory_snapshot, parse_client_fixture, parse_server_fixture,
-    parse_soak_duration, run_client_forward_tcp_echo, run_client_forward_udp_echo,
+    connect_client, parse_client_fixture, parse_server_fixture, parse_soak_duration,
+    run_client_forward_tcp_echo, run_client_forward_udp_echo,
     run_concurrent_socks5_udp_associations, run_dae_connector_tcp_echo, run_dae_connector_udp_echo,
-    run_mixed_tcp_echo, run_relay_soak, run_server_egress_tcp_echo, run_server_egress_udp_echo,
-    run_server_lifecycle_churn, run_tcp_throughput_cell, soak_duration_from_env,
-    validated_client_fixture, validated_server_fixture,
+    run_mixed_tcp_echo, run_server_egress_tcp_echo, run_server_egress_udp_echo,
+    run_server_lifecycle_churn, run_tcp_throughput_cell, validated_client_fixture,
+    validated_server_fixture,
 };
+#[cfg(target_os = "linux")]
+use zuicity_benchmarks::{current_process_memory_snapshot, run_relay_soak, soak_duration_from_env};
 
 #[test]
 fn config_fixtures_parse_and_validate() -> anyhow::Result<()> {
