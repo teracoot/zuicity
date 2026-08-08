@@ -43,30 +43,53 @@ juicity deployments interoperate with it unchanged.
 
 ## Benchmarks
 
-### Current BBR candidate
+### Separate Oracle BBR comparison
 
-The active candidate uses BBR on both Zuicity endpoints. The matched Oracle
-campaign compares it with official Hysteria2 v2.11.0 using the same BBR profile
-and same GSO treatment in each pair: off versus off and on versus on. Every row
+The preserved v0.4.0 candidate and packaged v0.5.0 use BBR on both Zuicity
+endpoints. Each matched Oracle campaign compares one Zuicity generation with
+official Hysteria2 v2.11.0 using the same BBR profile and same GSO treatment in
+each pair: off versus off and on versus on. The two campaigns used the same
+host, schedule, pinned Hysteria2 binary, and byte-identical harness. Every row
 used 60 fresh-connect RTT samples, 60 persistent RTT samples, 100
 send-plus-full-echo transfers of 4 MiB, and five warmups. Server and echo were
 pinned to CPU 0; client and driver were pinned to CPU 1.
 
-| GSO | Implementation | Throughput (Mbps) | Proxy CPU (s) | Pair wins |
-|---|---|---:|---:|---:|
-| off | **Zuicity BBR** | **86.44** | **52.27** | **5/5** |
-| off | Hysteria2 BBR | 80.12 | 61.57 | 0/5 |
-| on | **Zuicity BBR** | **179.94** | **18.52** | **5/5** |
-| on | Hysteria2 BBR | 107.21 | 41.97 | 0/5 |
+| Candidate | GSO | Implementation | Throughput (Mbps) | Proxy CPU (s) | Pair wins |
+|---|---|---|---:|---:|---:|
+| packaged v0.5.0 | off | **Zuicity BBR** | **84.76** | **53.73** | **5/5** |
+| packaged v0.5.0 | off | Hysteria2 BBR | 80.75 | 61.88 | 0/5 |
+| packaged v0.5.0 | on | **Zuicity BBR** | **180.91** | **18.67** | **5/5** |
+| packaged v0.5.0 | on | Hysteria2 BBR | 108.17 | 40.72 | 0/5 |
+| preserved v0.4.0 | off | **Zuicity BBR** | **86.44** | **52.27** | **5/5** |
+| preserved v0.4.0 | off | Hysteria2 BBR | 80.12 | 61.57 | 0/5 |
+| preserved v0.4.0 | on | **Zuicity BBR** | **179.94** | **18.52** | **5/5** |
+| preserved v0.4.0 | on | Hysteria2 BBR | 107.21 | 41.97 | 0/5 |
 
-Zuicity's median throughput advantage was 7.88% off/off and 67.84% on/on. The
-four pre-campaign syscall probes proved zero `UDP_SEGMENT` data sends in both
-off arms, successful segmented sends in both on arms, and zero `UDP_SEGMENT`
-capability probes in every arm. The frozen candidate hashes are
+Packaged v0.5.0's median paired throughput advantage was 7.66% off/off and
+66.80% on/on. Its throughput changed by -1.93% off and +0.54% on versus the
+preserved v0.4.0 medians; the pinned Hysteria2 baseline moved by less than 1%
+in either mode. For the v0.4.0 campaign, the ratios of arm medians were 7.88%
+off/off and 67.84% on/on; its median paired advantages were 7.98% and 67.93%.
+All eight pre-campaign syscall probes across the two generations proved zero
+`UDP_SEGMENT` data sends in both off arms, successful segmented sends in both
+on arms, and zero `UDP_SEGMENT` capability probes in every arm.
+
+The packaged v0.5.0 hashes are
+`64f4a25c6bfd7f1037136155ac3f937024b0d744624db0f1faf07f0fc7b8f420`
+(client) and
+`47672ee67471451e1d9a2901abb3a737723ac22babc48667309d43d79a773e21`
+(server). The preserved v0.4.0 hashes are
 `a63adaff2ec2852516ac8664bbe3b20f440234682452d0a7134d0a2a7beda11d`
 (client) and
 `5c1b1c2701c45cf84effe9e75b904cc249bf44789475735cecfd76f3cc039b6a`
-(server).
+(server). The pinned Hysteria2 hash in both campaigns is
+`d1b7996bff679f084c52541886ba2804dc582d237d6cbc820e0d6bf2393958bf`.
+
+The complete local evidence, including all raw samples, logs, resource records,
+and syscall traces, is retained under these campaign identifiers:
+
+- v0.5.0: `oracle-veth-matched-bbr-gso-hy2-20260807T004000Z` (`summary.json` SHA-256 `ac0fcd00e7c2c4d912c3e03205a0236050b9d6b21edc6cd5fd747c0bd5748d9a`)
+- v0.4.0: `matched-bbr-gso-a63adaff` (`summary.json` SHA-256 `69f5dc2135146eaf3558d4262290902f3acce3a3920563c3f33c407e2cd15c33`)
 
 `congestion_control` is local to each QUIC sender. `bbr`, `cubic`, and
 `new_reno` are wired to Quinn, but BBR is the selected candidate and the
@@ -79,14 +102,59 @@ won all five pairs. This result is retained as investigation evidence only.
 CUBIC is not the selected candidate, is not the default, and is not required by
 the release profile.
 
-### Historical four-product GSO campaign
+### Packaged v0.5.0 four-product GSO campaign
 
-This matched campaign used two fresh Linux network namespaces joined by a
-`veth` pair, real kernel IP and QUIC stacks, and one complete eight-treatment
-Williams square. It completed eight balanced rotations, 64 accepted rows, and
-640 accepted throughput transfers. Each row contained 60 fresh-connect RTT,
-60 persistent RTT, and 10 throughput samples. Values are medians of the eight
-accepted rotation-level row medians.
+Packaged v0.5.0 was replayed under the exact environment and contract of the
+previous v0.4.0 four-product campaign: the same WSL2 Ubuntu instance and kernel,
+Ryzen 7 5800X, CPU assignments, comparator binaries, GSO controls, harness,
+quality gates, and byte-identical eight-treatment Williams schedule. The sole
+intended substitutions were the packaged Zuicity client and server. The run
+completed eight balanced rotations, 64 accepted rows, and 640 accepted
+throughput transfers. Each row contained 60 fresh-connect RTT, 60 persistent
+RTT, and 10 throughput samples. Values are medians of the eight accepted
+rotation-level row medians.
+
+| Implementation | Effective GSO | Throughput (Mbps) | Connect RTT (ms) | Persistent RTT (ms) | Combined HWM (KiB) |
+|---|---|---:|---:|---:|---:|
+| **Zuicity v0.5.0** | full on | **1149.34** | 0.883 | **0.381** | **16,602** |
+| Stock Go v0.5.0 | shipping client-off/server-on | 694.76 | 0.879 | 0.513 | 38,400 |
+| Repaired Go v0.5.0 | full on | 995.04 | **0.825** | 0.508 | 38,848 |
+| Latest juicity-rs | Quinn default on | 17.74 | 30.414 | 27.711 | 41,530 |
+| **Zuicity v0.5.0** | native off | **764.13** | 0.817 | **0.386** | **16,578** |
+| Stock Go v0.5.0 | native off | 657.35 | 0.918 | 0.526 | 38,398 |
+| Repaired Go v0.5.0 | native off | 694.11 | **0.807** | 0.503 | 38,336 |
+| Latest juicity-rs | externally controlled off | 5.14 | 28.613 | 27.495 | 31,358 |
+
+Against stock Go, packaged v0.5.0's paired throughput change was +71.76% with
+GSO on (6-2, exact one-sided sign-test p=0.1445) and +12.16% with GSO off
+(6-2, p=0.1445). Against repaired Go it was +10.60% on (5-3, p=0.3633) and
++2.99% off (4-4, p=0.6367). None of the four Go comparisons met the 0.05
+threshold with eight rotations.
+
+All eight GSO probes passed. Six latest-`juicity-rs` GSO-on attempts timed out
+and were retained; every scheduled row obtained a complete accepted replacement
+within the unchanged five-attempt limit. Candidate throughput was also variable,
+with row CVs of 53.62% on and 32.44% off. Relative to the previous candidate's
+arm medians, packaged v0.5.0 was 10.14% lower on and 3.62% higher off, but the
+unchanged Go arms drifted from -3.70% to +16.01%, so the cross-campaign changes
+are not clean causal version effects.
+
+The complete fresh evidence is retained as campaign
+`v050-go-jrs-common-512k-8x10-20260807-v1`.
+Its `results.jsonl`, `summary.json`, `probes.jsonl`, and `rejected.jsonl`
+SHA-256 hashes are respectively
+`43b7fac9a2090430d0f57c02196feb57411ce3c2379d820a547831150c29bf07`,
+`c7da0840b78634f4a644391cb49ccb3a6159fe13bc3a5d0039a18b092ac0140f`,
+`bac1cf378c16907178136b2164b10a70e3381bceed52323dda19ddf7d3a319e9`,
+and `347abff1490fa5caaba028d3c98044227ae6184fd805ca65fb3b3526076390cf`.
+See [`docs/benchmarks/v0.5.0-four-product-512k.md`](./docs/benchmarks/v0.5.0-four-product-512k.md)
+for the full qualification.
+
+### Previous v0.4.0 four-product GSO campaign
+
+The previous campaign used the same two-namespace `veth` topology, host,
+eight-treatment Williams square, workload, CPU assignments, and comparator
+artifacts. It likewise completed eight balanced rotations and 64 accepted rows.
 
 | Implementation | Effective GSO | Throughput (Mbps) | Connect RTT (ms) | Persistent RTT (ms) | Combined HWM (KiB) |
 |---|---|---:|---:|---:|---:|
@@ -107,15 +175,15 @@ p=0.3633). Against repaired Go it was +19.69% on (7-1, p=0.0352) and +18.83%
 off (6-2, p=0.1445). With eight rotations, the GSO-on Go comparisons met the
 0.05 threshold; the GSO-off comparisons did not.
 
-The common throughput payload was reduced to 512 KiB for every implementation
-because latest `juicity-rs` timed out on one 4 MiB transfer after 120 seconds,
-despite 141 successful `UDP_SEGMENT` sends. This is therefore a complete,
-balanced common-workload comparison, not the canonical 4 MiB campaign. All
-eight GSO probes passed. One `juicity-rs` GSO-on warmup timed out and was
-retained; its retry passed. Its throughput was also highly variable, with row
-CVs of 155.85% on and 136.96% off. Upstream HEAD and the latest release were
-both `v0.1.0.beta.8` at commit `33caa0f`; the official x86-64-v3 binaries were
-used.
+The common throughput payload in both generations was reduced to 512 KiB for
+every implementation because latest `juicity-rs` timed out on one 4 MiB
+transfer after 120 seconds, despite 141 successful `UDP_SEGMENT` sends. These
+are therefore complete, balanced common-workload comparisons, not canonical
+4 MiB campaigns. All eight v0.4.0 GSO probes passed. One `juicity-rs` GSO-on
+warmup timed out and was retained; its retry passed. Its throughput was also
+highly variable, with row CVs of 155.85% on and 136.96% off. Upstream HEAD and
+the latest release were both `v0.1.0.beta.8` at commit `33caa0f`; the official
+x86-64-v3 binaries were used.
 
 ### Historical Real-Internet WAN (US client to KR server, ~129 ms RTT)
 
@@ -141,10 +209,12 @@ manifest-driven release harness live in
 [`docs/benchmarks`](./docs/benchmarks) and
 [`scripts/benchmark`](./scripts/benchmark):
 
-- `docs/benchmarks/v0.4.0-four-product-512k.md` - methodology, hashes, comparisons, and limitations
-- `docs/benchmarks/benchmark-chart.svg` / `.png` / `.md` - the current matched-campaign chart and table
+- `docs/benchmarks/v0.5.0-four-product-512k.md` - packaged v0.5.0 replay, hashes, comparisons, and limitations
+- `docs/benchmarks/v0.4.0-four-product-512k.md` - previous v0.4.0 methodology, hashes, comparisons, and limitations
+- `docs/benchmarks/benchmark-chart.svg` / `.png` / `.md` - the previous v0.4.0 matched-campaign chart and table
 - `scripts/benchmark/run-comparison.sh` - run a hash-pinned TCP GSO campaign
-- `scripts/benchmark/tcp-gso-v040-go-jrs.example.json` - exact four-product artifacts and mode controls
+- `scripts/benchmark/tcp-gso-v050-go-jrs.example.json` - packaged v0.5.0 four-product artifacts and mode controls
+- `scripts/benchmark/tcp-gso-v040-go-jrs.example.json` - previous v0.4.0 four-product artifacts and mode controls
 - `docs/benchmarks/benchmark-comparison.xlsx`, `results.jsonl`, and `memory.jsonl` - retired historical data
 
 > The `veth` numbers are from a single-host bench for relative comparison under
@@ -186,6 +256,11 @@ size:
   cost.
 
 ## Reliability
+
+The blocking release gates, evidence contract, cross-platform matrix, stress and
+soak criteria, benchmark qualification, security review, and deployment/rollback
+procedure are defined in
+[`docs/production-readiness-testing.md`](./docs/production-readiness-testing.md).
 
 - **Safe GSO default and fallback.** Without an explicit opt-in, Linux sends
   grouped traffic as ordinary datagrams through safe `sendmmsg`.
@@ -263,14 +338,16 @@ export JUICITY_RS_GSO_SHIM=<hash-pinned GSO-off preload path>
 
 sudo --preserve-env=CANDIDATE_BIN_DIR,GO_STOCK_BIN_DIR,GO_REPAIRED_BIN_DIR,JUICITY_RS_BIN_DIR,JUICITY_RS_GSO_SHIM \
   scripts/benchmark/run-comparison.sh \
-  --manifest scripts/benchmark/tcp-gso-v040-go-jrs.example.json \
-  --out-dir benchmark-results/v040-go-jrs-common-512k \
+  --manifest scripts/benchmark/tcp-gso-v050-go-jrs.example.json \
+  --out-dir benchmark-results/v050-go-jrs-common-512k \
   --profile standard \
   --rtt-samples 60 \
   --throughput-samples 10 \
   --throughput-bytes 524288 \
   --warmup-transfers 2 \
   --max-row-attempts 5 \
+  --idle-wait-seconds 180 \
+  --cpus <reviewed monitored CPU union> \
   --server-cpus <reviewed server CPUs> \
   --client-cpus <reviewed client CPUs> \
   --driver-cpus <reviewed driver CPU> \

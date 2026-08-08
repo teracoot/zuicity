@@ -15,12 +15,17 @@ both GSO-on and GSO-off treatments:
 | `v040-prior` | previous accepted v0.4.0 package |
 | `go-repaired` | pinned Juicity Go v0.5.0 package with the full GSO repair |
 
-`tcp-gso-v040-go-jrs.example.json` provides the product comparison across the
-current candidate, stock Go, repaired Go, and the latest official
+`tcp-gso-v040-go-jrs.example.json` provides the previous v0.4.0 product
+comparison across that candidate, stock Go, repaired Go, and the latest official
 `github.com/juicity/juicity-rs` release. Its stock-Go on treatment uses shipping
 client-off/server-on behavior. Because `juicity-rs` has no GSO-off runtime
 switch, its off treatment uses a hash-pinned preload control that denies Quinn's
 `UDP_SEGMENT` capability probe while leaving the release binaries unchanged.
+
+`tcp-gso-v050-go-jrs.example.json` preserves the same comparator definitions and
+mode controls while replacing only the candidate identity and hashes with the
+packaged v0.5.0 Linux x86_64 artifacts. It is the manifest used for the matched
+512 KiB replay documented in `docs/benchmarks/v0.5.0-four-product-512k.md`.
 
 The manifest, not a directory label, defines artifact identity. Every client and
 server has a required SHA256, and execution stops before timing if any hash does
@@ -41,14 +46,17 @@ not match.
   controls.
 - `tcp-gso-v040-go-jrs.example.json` pins the requested four-product comparison,
   including the latest official `juicity-rs` artifacts and GSO-off control.
+- `tcp-gso-v050-go-jrs.example.json` pins the packaged v0.5.0 replay with the
+  same three comparators and controls.
 - `test_tcp_gso_suite.py` covers manifest validation, scheduling, trace parsing,
   and rotation-level inference.
 
-The current `benchmark-chart.svg`, `.png`, and `.md` under `docs/benchmarks/`
-were rendered from the qualified four-product suite summary. The spreadsheet,
-`results.jsonl`, and `memory.jsonl` in that directory are historical products of
-the retired three-way harness and must not be relabeled as v0.3.0/v0.4.0 release
-evidence.
+The `benchmark-chart.svg`, `.png`, and `.md` files under `docs/benchmarks/` were
+rendered from the qualified v0.4.0 four-product summary. The packaged v0.5.0
+replay is documented separately rather than relabeling the previous chart. The
+spreadsheet, `results.jsonl`, and `memory.jsonl` in that directory are historical
+products of the retired three-way harness and must not be relabeled as
+v0.3.0/v0.4.0 release evidence.
 
 ## Requirements
 
